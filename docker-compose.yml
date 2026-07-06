@@ -1,0 +1,67 @@
+# ==================== 电商秒杀系统 ====================
+# 启动: docker-compose up -d
+# 停止: docker-compose down
+# 日志: docker-compose logs -f app
+
+services:
+
+  # ==================== 应用 ====================
+  app:
+    build: .
+    container_name: miaosha-app
+    ports:
+      - "18091:18091"
+    environment:
+      # JVM 参数 → 改 .env 文件的 JAVA_OPTS
+      - JAVA_OPTS=${JAVA_OPTS}
+      # 数据库连接 → 改 .env 文件的 MYSQL_*
+      # 3306 是 Docker 内部端口（固定），外部访问用 13306（见 mysql.ports）
+      - SPRING_DATASOURCE_URL=jdbc:mysql://${MYSQL_HOST}:3306/${MYSQL_DATABASE}?useUnicode=true&characterEncoding=UTF-8&useSSL=false
+      - SPRING_DATASOURCE_USERNAME=${MYSQL_USERNAME}
+      - SPRING_DATASOURCE_PASSWORD=${MYSQL_PASSWORD}
+    volumes:
+      # 额外 Spring Boot 配置
+      - ./application.yml:/home/xiong/miaosha/application.yml
+      # 日志目录
+      - ./logs:/app/logs
+    restart: always
+    depends_on:
+      mysql:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1.5g
+
+  # ==================== MySQL ====================
+  mysql:
+    image: mysql:5.7
+    container_name: miaosha-mysql
+    ports:
+      - "13306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_ROOT_HOST=%                # 允许 root 从任意 IP 连接（Navicat 必须）
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - TZ=Asia/Shanghai
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./sql:/docker-entrypoint-initdb.d
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+      - --sql-mode=NO_ENGINE_SUBSTITUTION
+    deploy:
+      resources:
+        limits:
+          memory: 400m
+    restart: always
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mysql-data:

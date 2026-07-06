@@ -1,0 +1,40 @@
+# ==================== Maven ====================
+target/
+
+# ==================== IDE ====================
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+
+# ==================== 部署敏感配置 ====================
+.env
+application.yml
+config/
+
+# ==================== 日志 ====================
+logs/
+*.log
+
+# ==================== Java ====================
+*.class
+*.jar
+*.war
+*.nar
+*.ear
+!.mvn/wrapper/maven-wrapper.jar
+
+# ==================== Maven wrapper ====================
+!.mvn/wrapper/maven-wrapper.properties
+
+# ==================== OS ====================
+Thumbs.db
+.DS_Store
+*~
+*.swp
+*.swo
+
+# ==================== Docker ====================
+docker-compose.override.yml
