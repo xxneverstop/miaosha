@@ -3,6 +3,12 @@ target/
 
 # ==================== IDE ====================
 .idea/
+.agents/
+.claude/
+.git/
+
+
+
 *.iml
 .vscode/
 .settings/
