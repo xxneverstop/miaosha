@@ -1,0 +1,57 @@
+server:
+  port: 18091
+
+mybatis:
+  mapper-locations: classpath:mapping/*.xml
+
+mq:
+  nameserver:
+    addr: ${MQ_NAMESERVER_ADDR:127.0.0.1:19876}
+  topicname: ${MQ_TOPICNAME:stock_topic}
+
+spring:
+  datasource:
+    name: miaosha
+    url: ${SPRING_DATASOURCE_URL:jdbc:mysql://127.0.0.1:13306/miaosha?useUnicode=true&characterEncoding=UTF-8&useSSL=false}
+    username: ${SPRING_DATASOURCE_USERNAME:${MYSQL_USERNAME:root}}
+    password: ${SPRING_DATASOURCE_PASSWORD:${MYSQL_PASSWORD}}
+    type: com.alibaba.druid.pool.DruidDataSource
+    driver-class-name: com.mysql.jdbc.Driver
+
+  redis:
+    host: ${SPRING_REDIS_HOST:${REDIS_HOST:127.0.0.1}}
+    port: ${SPRING_REDIS_PORT:${REDIS_PORT:16379}}
+    password: ${SPRING_REDIS_PASSWORD:${REDIS_PASSWORD:}}
+    database: 10
+    jedis:
+      pool:
+        max-active: 50
+        min-idle: 20
+
+  mvc:
+    throw-exception-if-no-handler-found: true
+
+# ============================
+# 压测对比开关
+# ============================
+miaosha:
+  # 库存扣减模式: mysql | redis | lua
+  stock-mode: lua
+
+  # 缓存模式: none | redis-only | multi-level
+  cache-mode: multi-level
+
+  # 售罄快速失败: true | false
+  sold-out-flag: true
+
+  # 秒杀大闸: true | false
+  second-kill-gate: true
+
+  # 队列泄洪: true | false
+  queue-discharge: true
+
+  # MQ 异步同步（true） vs 事务内同步（false）
+  mq-async-sync: true
+
+  # 验证码: true | false
+  verify-code: false

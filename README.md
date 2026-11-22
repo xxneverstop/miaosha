@@ -4,6 +4,8 @@
 
 本文依据当前 Java 源码、Mapper XML、SQL 与部署脚本整理。部分历史文档中的参数与当前实现不同，以下明确区分源码行为、部署前提和历史压测记录。
 
+后续开发、部署、测试与可靠性完善按[项目 Roadmap](docs/roadmap.md)推进，先确定环境和资源，再逐步完成实现与验收。
+
 ## 导航
 
 - [功能与技术栈](#功能与技术栈)
@@ -133,11 +135,11 @@ sequenceDiagram
 
 Broker 回查 `stock_log`：`2` 返回 COMMIT，`1` 或记录不存在返回 UNKNOWN，其他状态返回 ROLLBACK。生产者捕获 `BusinessException` 时将流水更新为 `3`。消费者使用 `stockLogId` 构造 Redis 去重 Key，设置 1 小时过期后执行数据库库存更新。
 
-这些机制提供最终一致性的基础；消费失败恢复、异常回滚语义等限制见[当前实现边界](#当前实现边界)。源码中尚无定时对账任务。
+这些机制用于协调订单与库存同步，但 Redis 去重与数据库更新不在同一事务，不能据此无条件宣称最终一致。消费失败恢复、异常回滚语义等限制见[当前实现边界](#当前实现边界)。源码中尚无定时对账任务。
 
 ## 快速开始
 
-### 1. 环境与首次克隆前提
+### 1. 环境与配置入口
 
 准备 JDK 8、Maven、MySQL 5.7、Redis、RocketMQ NameServer/Broker。使用容器脚本时还需要 Docker 和 Bash，Windows 可使用 WSL 或其他能够运行脚本的 Bash 环境。
 
@@ -148,114 +150,26 @@ java -version
 mvn -version
 ```
 
-**当前仓库有一项必须处理的配置缺口：** `.gitignore` 的 `application.yml` 与 `config/` 规则会匹配任意层级。本地的 `src/main/resources/application.yml`、`config/RedisConfig.java` 和 `config/WebServerConfiguration.java` 未纳入版本控制，首次克隆不会得到这些文件。运行前需创建下面的配置，并恢复 Redis 配置类。Tomcat 的 keep-alive 定制类可另行恢复，不是核心业务依赖。
-
-<details>
-<summary>首次克隆：RedisTemplate 配置示例</summary>
-
-创建 `src/main/java/com/imooc/miaoshaproject/config/RedisConfig.java`。它配置字符串 Key、Jackson 对象 Value、Joda-Time 转换和 Redis Session，供库存 Lua、对象缓存与 OTP 注册使用。示例沿用本项目本地配置的序列化方式。
-
-```java
-package com.imooc.miaoshaproject.config;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.module.SimpleModule;
-import com.imooc.miaoshaproject.serializer.JodaDateTimeJsonDeserializer;
-import com.imooc.miaoshaproject.serializer.JodaDateTimeJsonSerializer;
-import org.joda.time.DateTime;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.data.redis.connection.RedisConnectionFactory;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
-import org.springframework.data.redis.serializer.StringRedisSerializer;
-import org.springframework.session.data.redis.config.annotation.web.http.EnableRedisHttpSession;
-
-@Configuration
-@EnableRedisHttpSession(maxInactiveIntervalInSeconds = 3600)
-public class RedisConfig {
-    @Bean
-    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory factory) {
-        RedisTemplate<String, Object> template = new RedisTemplate<>();
-        template.setConnectionFactory(factory);
-        template.setKeySerializer(new StringRedisSerializer());
-        ObjectMapper mapper = new ObjectMapper();
-        SimpleModule module = new SimpleModule();
-        module.addSerializer(DateTime.class, new JodaDateTimeJsonSerializer());
-        module.addDeserializer(DateTime.class, new JodaDateTimeJsonDeserializer());
-        mapper.registerModule(module);
-        mapper.enableDefaultTyping(ObjectMapper.DefaultTyping.NON_FINAL);
-        Jackson2JsonRedisSerializer<Object> serializer =
-                new Jackson2JsonRedisSerializer<>(Object.class);
-        serializer.setObjectMapper(mapper);
-        template.setValueSerializer(serializer);
-        return template;
-    }
-}
-```
-
-默认 JDK 序列化不能直接替代这套配置：Lua 的 `GET` / `tonumber` 与对象缓存反序列化都依赖兼容的数据格式。切换序列化方式后应使用独立测试数据库或重新初始化对应缓存。
-
-</details>
-
-### 2. 初始化数据库与应用配置
-
-在新建的测试数据库中导入 [sql/miaosha.sql](sql/miaosha.sql)。该文件包含 `DROP TABLE` 和演示数据，只应用于允许重建的测试库。
+基础配置和 Redis/Tomcat 配置类位于源码目录，无需手工重建。连接参数统一从环境变量传入，先复制模板并填写本机或容器环境：
 
 ```bash
-mysql -h 127.0.0.1 -P 13306 -u root -p \
-  -e "CREATE DATABASE IF NOT EXISTS miaosha CHARACTER SET utf8mb4;"
-mysql -h 127.0.0.1 -P 13306 -u root -p miaosha < sql/miaosha.sql
+cp .env.example .env
 ```
 
-创建 `src/main/resources/application.yml`，按实际环境调整连接地址。以下端口对应分服务 Docker 脚本映射到宿主机的端口，直接安装的服务应改成其实际端口。
+| 文件 | 职责 |
+| --- | --- |
+| [src/main/resources/application.yml](src/main/resources/application.yml) | 随 JAR 打包的基础配置：MyBatis、缓存/库存开关及环境变量占位 |
+| [application.yml](application.yml) | Docker 加载的额外覆盖配置，目前仅 Tomcat 和日志参数 |
+| [.env.example](.env.example) | 可提交的连接参数模板；实际值填写到被 Git 忽略的 `.env` |
+| [docker-compose.yml](docker-compose.yml) / [scripts/](scripts/) | 读取 `.env`，映射为应用需要的 Spring / MQ 环境变量 |
 
-```yaml
-server:
-  port: 18091
-mybatis:
-  mapper-locations: classpath:mapping/*.xml
-spring:
-  datasource:
-    name: miaosha
-    type: com.alibaba.druid.pool.DruidDataSource
-    driver-class-name: com.mysql.jdbc.Driver
-    url: ${SPRING_DATASOURCE_URL:jdbc:mysql://127.0.0.1:13306/miaosha?useUnicode=true&characterEncoding=UTF-8&useSSL=false}
-    username: ${SPRING_DATASOURCE_USERNAME:root}
-    password: ${SPRING_DATASOURCE_PASSWORD}
-  redis:
-    host: ${SPRING_REDIS_HOST:127.0.0.1}
-    port: ${SPRING_REDIS_PORT:16379}
-    password: ${SPRING_REDIS_PASSWORD}
-    database: 10
-mq:
-  nameserver:
-    addr: ${MQ_NAMESERVER_ADDR:127.0.0.1:19876}
-  topicname: stock_topic
-miaosha:
-  stock-mode: lua
-  cache-mode: multi-level
-  sold-out-flag: true
-  second-kill-gate: true
-  queue-discharge: true
-  mq-async-sync: true
-  verify-code: false
-```
+`.env` 约定包含 `JAVA_OPTS`、`MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_DATABASE`、`MYSQL_USERNAME`、`MYSQL_PASSWORD`、`REDIS_HOST`、`REDIS_PORT`、`REDIS_PASSWORD`、`MQ_NAMESERVER_ADDR`、`MQ_TOPICNAME`，以及本机运行使用的 `SPRING_DATASOURCE_URL`。基础配置接受 `SPRING_DATASOURCE_*` / `SPRING_REDIS_*`，并为用户名、密码及 Redis 地址保留模板变量映射。Spring Boot 本身不会自动读取 `.env`；本地 Maven 运行的导出方式见下文。
 
-通过环境变量设置自己的数据库、Redis 密码。Linux / Bash 使用 `export SPRING_DATASOURCE_PASSWORD='你的数据库密码'` 和 `export SPRING_REDIS_PASSWORD='你的Redis密码'`；PowerShell 使用 `$env:SPRING_DATASOURCE_PASSWORD='你的数据库密码'` 和 `$env:SPRING_REDIS_PASSWORD='你的Redis密码'`。没有 Redis 密码时将对应变量设为空字符串。
+分服务脚本直接加载 `.env`，同名值以该文件为准；Compose 按自身规则优先使用已导出的 Shell 变量。`MYSQL_USERNAME` 默认使用初始化的 `root`，其他数据库账号需要提前创建。
 
-```bash
-mvn clean package -DskipTests
-# 产物：target/miaosha-1.0-SNAPSHOT.jar
-java -jar target/miaosha-1.0-SNAPSHOT.jar
-# 开发时也可使用：mvn spring-boot:run
-```
+### 2. 完整演示：分服务 Docker 脚本
 
-应用监听 `18091`。先用 `GET http://localhost:18091/item/list` 检查响应，再按[调用示例](#接口与调用示例)登录、发布活动和下单。Producer 与 Consumer 会随应用初始化，关闭异步同步开关也不会移除 RocketMQ 的启动依赖。
-
-### 3. 使用分服务 Docker 脚本
-
-以下命令在仓库根目录的 Bash 中运行。先检查各脚本顶部的端口、内存、密码参数；MySQL、Redis 与应用脚本中的凭证必须一致。
+以下命令在仓库根目录的 Bash 中运行。脚本读取 `.env`，应用默认使用 Docker 网络中的服务名和容器端口；宿主机客户端使用端口映射。填写的密码须与已有数据库、Redis 实例一致。
 
 ```bash
 bash scripts/start-mysql.sh
@@ -266,14 +180,12 @@ bash scripts/start-rocketmq.sh "$BROKER_HOST_IP"
 
 mvn clean package -DskipTests
 cp target/miaosha-1.0-SNAPSHOT.jar miaosha.jar
-# Dockerfile 还会加载此文件；如果无需覆盖配置，也应先创建一个空文件
-touch application.yml
 bash scripts/start-app.sh
 bash scripts/start-nginx.sh
 bash scripts/status.sh
 ```
 
-MySQL 脚本会在数据卷首次初始化时导入 `sql/` 中的 SQL。已有数据卷不会重新导入。Dockerfile 的构建输入是根目录 `miaosha.jar`，每次修改 Java 代码后都需要重新打包并复制。
+MySQL 脚本会在数据卷首次初始化时导入 [sql/miaosha.sql](sql/miaosha.sql)，其中包含 `DROP TABLE` 和演示数据，只应用于允许重建的测试库。已有数据卷不会重新导入。Dockerfile 的构建输入是根目录 `miaosha.jar`，每次修改 Java 代码后都需要重新打包并复制。
 
 | 服务 | 宿主机端口 | 容器端口 |
 | --- | --- | --- |
@@ -287,18 +199,62 @@ MySQL 脚本会在数据卷首次初始化时导入 `sql/` 中的 SQL。已有�
 
 浏览器入口为 `http://localhost:81/resources/login.html`，商品列表为 `/resources/listitem.html`。Nginx 只在 `/resources/` 下提供静态页面，其他路径转发后端。`start-nginx.sh` 会将 `html/gethost.js` 改为 `window.location.host`，使页面 API 请求走相同代理地址。
 
-可选第二实例由 `bash scripts/start-app2.sh` 启动。使用 `nginx/nginx-scale.conf` 前，需要把其中实例 2 的上游端口从 `18092` 改成 **18091**：Nginx 在 Docker 网络里使用容器端口，18092 是宿主机映射端口；再调整 `start-nginx.sh` 的 `CONF_FILE` 并重新启动 Nginx。
+可选第二实例由 `bash scripts/start-app2.sh` 启动。双实例使用 [nginx/nginx-scale.conf](nginx/nginx-scale.conf)，将 `start-nginx.sh` 的 `CONF_FILE` 改为该文件名后重启 Nginx。容器间访问使用 `18091`；`18092` 仅是实例 2 的宿主机映射端口。
 
 查看应用日志使用 `docker logs -f miaosha-app-1`。`bash scripts/stop-all.sh` 会停止并删除脚本创建的容器，保留 MySQL 命名数据卷；Redis 和 RocketMQ 脚本没有挂载持久化数据卷，重建容器会丢失其容器内数据。
 
-<details>
-<summary>现有 Docker Compose 的适用范围</summary>
+### 3. Docker Compose：仅 App + MySQL
 
 [docker-compose.yml](docker-compose.yml) 当前只声明 `app` 和 `mysql`，没有编排 Redis、RocketMQ 或 Nginx。不能把 `docker compose up -d` 当作完整系统的一键启动命令。
 
-使用前需自行准备 Redis / MQ、根目录 `miaosha.jar` 与 `application.yml`，并创建 `.env`，提供 `JAVA_OPTS`、`MYSQL_HOST`、`MYSQL_DATABASE`、`MYSQL_USERNAME`、`MYSQL_PASSWORD`；其中 `MYSQL_HOST=mysql` 表示 Compose 内的数据库服务。应用的 Redis / MQ 地址需通过挂载配置文件设置为可达地址。Compose 与分服务脚本的数据库数据卷不同，也会争用相同容器名和宿主机端口，应选择一种方式运行。
+使用前需自行准备可从应用容器访问的 Redis / MQ，在 `.env` 中设置其地址与凭证。`MYSQL_HOST=mysql` 是 Compose 内的数据库服务名；`MYSQL_PORT` 默认 `13306`，仅用于宿主机端口映射，应用访问数据库仍固定使用容器端口 `3306`。Redis / MQ 地址不能写成应用容器中的 `localhost`，Broker 对外通告地址也必须可达；Docker Desktop 可按实际部署使用 `host.docker.internal` 访问宿主机。
 
-</details>
+```bash
+mvn clean package -DskipTests
+cp target/miaosha-1.0-SNAPSHOT.jar miaosha.jar
+docker compose up -d --build
+docker compose logs -f app
+# 停止这组 Compose 服务：docker compose down
+```
+
+Windows 可在配置好 JDK 8、Maven 和 `.env` 后运行 `package.bat`。它使用 `JAVA_HOME` / `MAVEN_HOME` 或 `PATH`，生成 `target/deploy/`：包含 `miaosha.jar`、Dockerfile、Compose、`.dockerignore`、覆盖配置、`.env` 和初始化 SQL。完整目录上传至服务器后再运行 Compose；目录中的 `.env` 含部署凭证，应保存在自己的受控部署环境。
+
+Compose 与分服务脚本的数据库数据卷不同，也会争用部分容器名和宿主机端口，应选择一种方式启动 App / MySQL。
+
+### 4. 本机 Maven 运行
+
+先准备 MySQL、Redis、RocketMQ，并在隔离测试库中导入 `sql/miaosha.sql`。本机访问分服务脚本启动的依赖时，MySQL 使用 `127.0.0.1:13306`、Redis 使用 `127.0.0.1:16379`、NameServer 使用 `127.0.0.1:19876`，Broker 通告地址还须能从本机访问。
+
+先检查 `.env` 中本机使用的 `SPRING_DATASOURCE_URL`、Redis 地址及 MQ 地址；`MYSQL_HOST` / `MYSQL_PORT` 用于 Compose，不能直接视为本机数据库地址。Bash 中手动导出配置后运行：
+
+```bash
+set -a
+. ./.env
+set +a
+mvn spring-boot:run
+```
+
+PowerShell 中可直接设置 `$env:SPRING_DATASOURCE_URL`、`$env:SPRING_DATASOURCE_USERNAME`、`$env:SPRING_DATASOURCE_PASSWORD`、`$env:SPRING_REDIS_HOST`、`$env:SPRING_REDIS_PORT`、`$env:SPRING_REDIS_PASSWORD`、`$env:MQ_NAMESERVER_ADDR` 和 `$env:MQ_TOPICNAME` 后执行 Maven。也可打包后运行 `java -jar target/miaosha-1.0-SNAPSHOT.jar`；本机需要根覆盖配置时追加 `--spring.config.additional-location=file:./application.yml`。
+
+应用监听 `18091`。先用 `GET http://localhost:18091/item/list` 检查响应，再按[调用示例](#接口与调用示例)登录、发布活动和下单。Producer 与 Consumer 会随应用初始化，关闭异步同步开关也不会移除 RocketMQ 的启动依赖。
+
+### 5. 本地检查与手动生成 Mapper
+
+`mvn test` 运行配置测试，不连接数据库、Redis 或 MQ。在限制创建测试子进程的环境中，可用 `mvn -DforkCount=0 test`。Windows 的打包和启动参数检查使用假凭据、模拟 Docker 与 Maven，不启动服务：
+
+```powershell
+$env:BASH_EXECUTABLE = '你的 Git 安装目录\bin\bash.exe'
+python scripts/tests/verify-deployment.py
+```
+
+MyBatis Generator 仅手动执行，不参与普通 `package`。确需生成时，在隔离测试库中确认表结构，并检查生成结果，避免覆盖已手工修改的 Mapper。根 `.env` 的 `GENERATOR_JDBC_URL`、`GENERATOR_JDBC_USERNAME`、`GENERATOR_JDBC_PASSWORD` 用于保存生成器连接；先按上文导出变量，再执行：
+
+```bash
+mvn mybatis-generator:generate \
+  "-Djdbc.url=$GENERATOR_JDBC_URL" \
+  "-Djdbc.username=$GENERATOR_JDBC_USERNAME" \
+  "-Djdbc.password=$GENERATOR_JDBC_PASSWORD"
+```
 
 ## 接口与调用示例
 
@@ -357,9 +313,9 @@ curl -X POST 'http://localhost:18091/order/createorder?token=<登录token>' \
 
 ## 配置开关
 
-下表“本地配置值”依据当前工作目录中未跟踪的 `src/main/resources/application.yml`，首次克隆可使用上面的完整示例。RateLimiter 的 5 QPS 与线程池参数目前没有配置项。
+下表依据 [基础配置](src/main/resources/application.yml)。RateLimiter 的 5 QPS 与线程池参数目前没有配置项。
 
-| 配置项 | 本地配置值 | 实际作用 |
+| 配置项 | 基础配置值 | 实际作用 |
 | --- | --- | --- |
 | `miaosha.stock-mode` | `lua` | `mysql` 条件扣库、`redis` INCR + 失败回补、`lua` 原子判扣 |
 | `miaosha.cache-mode` | `multi-level` | `/item/get` 使用 `none`、`redis-only` 或 `multi-level` |
@@ -399,7 +355,7 @@ curl -X POST 'http://localhost:18091/order/createorder?token=<登录token>' \
 
 ## 压测与一致性检查
 
-仓库保留了[压测方案](docs/秒杀系统压测方案.md)和[历史结果报告](docs/秒杀系统压测结果报告.md)。报告记录了 2 核 2 GB、3 Mbps 公网、500 线程场景下下单吞吐从 142 到 1,200、P99 从 9,500 ms 到 1,650 ms，以及商品查询中 MySQL 读 QPS 约 90 → 2、Redis QPS 约 140 → 45。
+仓库保留了[压测方案](docs/backup/秒杀系统压测方案.md)和[历史结果报告](docs/backup/秒杀系统压测结果报告.md)。报告记录了 2 核 2 GB、3 Mbps 公网、500 线程场景下下单吞吐从 142 到 1,200、P99 从 9,500 ms 到 1,650 ms，以及商品查询中 MySQL 读 QPS 约 90 → 2、Redis QPS 约 140 → 45。
 
 这些是历史文档记录，仓库没有配套 `.jmx` / `.jtl` 原始测试文件；当前代码固定 5 QPS 限流，部分缓存参数和库存模式也与报告前提不同，因此上述数字不代表当前默认配置可复现的业务成功吞吐。本次 README 整理未重新执行并发压测。
 
@@ -442,15 +398,16 @@ Redis 初始库存 - Redis 剩余库存
 | 缓存一致性 | 没有主动失效和跨实例本地缓存广播；库存、销量、活动状态可能在 TTL 内陈旧。用户缓存读写 `user_calidate_`，过期设置却使用 `user_validate_`，实际 Key 未被设置 TTL |
 | 订单号事务 | `generateOrderNo` 是私有方法并在同类内部调用，不能把其 `REQUIRES_NEW` 注解视作已生效的独立事务 |
 | 登录与管理入口 | 密码使用 MD5 + Base64；发布活动、创建商品等接口尚无管理员鉴权；OTP 仅日志模拟。适合隔离的学习与演示环境 |
-| 构建与部署 | JDK 8 代码使用 `sun.misc.BASE64Encoder`；配置类被忽略、双实例代理端口、Compose 服务范围需按上文处理 |
+| 构建与部署 | JDK 8 代码使用 `sun.misc.BASE64Encoder`；Compose 仅包含 App / MySQL，运行仍依赖可达的 Redis / MQ；尚未提供端到端自动化验证 |
 
-[一人一单方案](docs/一人一单-方案设计.md)和其他文档中的扩展设计应与已实现代码区分阅读。
+[一人一单方案](docs/backup/一人一单-方案设计.md)和[项目完善方案](docs/my-docs/Miaosha_高并发后端_简历项目完善方案.md)中的扩展设计应与已实现代码区分阅读。本轮结构整理只统一配置、脚本与文档入口，没有实现这些业务改造。
 
 ## 代码导航与文档
 
 ```text
 src/main/java/com/imooc/miaoshaproject/
 ├── App.java                 Spring Boot 入口与 Mapper 扫描
+├── config/                  Redis 序列化、Session 与 Tomcat 配置
 ├── controller/              用户、商品、下单接口与异常处理
 ├── service/impl/            缓存、活动、库存、用户与订单逻辑
 ├── service/model/           业务领域模型
@@ -460,22 +417,25 @@ src/main/java/com/imooc/miaoshaproject/
 ├── serializer/              Joda-Time JSON 转换
 ├── validator/               参数校验
 └── error/、response/、util/   错误码、响应与验证码工具
-src/main/resources/mapping/  MyBatis XML
+src/main/resources/          基础 application.yml 与 mapping/ MyBatis XML
+application.yml             Docker 额外覆盖配置（Tomcat / 日志）
+.env.example                环境变量模板；本机实际值放 .env
 sql/                        表结构与演示数据
-html/                       页面、jQuery 与静态资源
+html/                       业务页面与 static/ 模板依赖，保留现有相对路径
 nginx/                      单实例 / 双实例代理配置
 scripts/                    分服务启动、状态与停止脚本
-docs/                       设计分析、修复记录、压测与面试资料
+docs/                       README 索引、my-docs 方案、backup 历史、reference 参考
 ```
 
 建议从 [OrderController](src/main/java/com/imooc/miaoshaproject/controller/OrderController.java) 进入，沿 [MqProducer](src/main/java/com/imooc/miaoshaproject/mq/MqProducer.java) → [OrderServiceImpl](src/main/java/com/imooc/miaoshaproject/service/impl/OrderServiceImpl.java) → [ItemServiceImpl](src/main/java/com/imooc/miaoshaproject/service/impl/ItemServiceImpl.java) 阅读下单，再看 [MqConsumer](src/main/java/com/imooc/miaoshaproject/mq/MqConsumer.java) 和 [PromoServiceImpl](src/main/java/com/imooc/miaoshaproject/service/impl/PromoServiceImpl.java)。
 
 | 文档 | 阅读内容 |
 | --- | --- |
-| [Redis Lua 扣库存](docs/Redis-Lua原子库存扣减-方案与问题分析.md) | INCR 方案到 Lua 的演进 |
-| [Redis 事务回退](docs/Redis库存事务回退问题分析.md) | 数据库事务与 Redis 补偿 |
-| [库存不一致排查](docs/库存不一致问题排查与修复.md) | 消息重投与重复扣库问题 |
-| [线程池有界队列](docs/线程池有界队列改造.md) | 队列容量与拒绝策略 |
-| [多级缓存讲稿](docs/multi-level-cache-interview.md) | 商品读链路与参数解释 |
-| [流量治理改动](docs/第九十章-流量削峰防刷限流代码改动详解.md) | 验证码、限流与大闸实现 |
-| [项目总结与问答](docs/秒杀项目-简历与面试问答总结.md) | 项目学习记录与面试复盘 |
+| [文档索引](docs/README.md) | 区分当前入口、待实施方案与历史记录 |
+| [Redis Lua 扣库存](docs/backup/Redis-Lua原子库存扣减-方案与问题分析.md) | INCR 方案到 Lua 的历史演进 |
+| [Redis 事务回退](docs/backup/Redis库存事务回退问题分析.md) | 数据库事务与 Redis 补偿 |
+| [库存不一致排查](docs/backup/库存不一致问题排查与修复.md) | 消息重投与重复扣库问题 |
+| [线程池有界队列](docs/backup/线程池有界队列改造.md) | 队列容量与拒绝策略 |
+| [多级缓存讲稿](docs/backup/multi-level-cache-interview.md) | 商品读链路与参数解释 |
+| [流量治理改动](docs/backup/第九十章-流量削峰防刷限流代码改动详解.md) | 验证码、限流与大闸实现 |
+| [项目总结与问答](docs/backup/秒杀项目-简历与面试问答总结.md) | 项目学习记录与面试复盘 |

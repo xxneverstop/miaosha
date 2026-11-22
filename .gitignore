@@ -16,12 +16,15 @@ target/
 .classpath
 
 # ==================== 部署敏感配置 ====================
-.env
-application.yml
-config/
+/.env
+/.env.*
+!/.env.example
+/application-local.yml
+/src/main/resources/application-local.yml
 
 # ==================== 日志 ====================
 logs/
+/logs2/
 *.log
 
 # ==================== Java ====================

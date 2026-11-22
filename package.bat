@@ -1,96 +1,80 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0" || exit /b 1
+set "MIAOSHA_PACKAGE_ROOT=%cd%"
+set "MIAOSHA_PACKAGE_DEPLOY=%cd%\target\deploy"
+set "JAR=%cd%\target\miaosha-1.0-SNAPSHOT.jar"
 
-title miaosha-package
-
-echo ============================================================
-echo   miaosha deploy package
-echo ============================================================
-echo.
-echo   PWD: %cd%
-echo.
-
-REM ==================== Step 1: Maven build ====================
 echo [1/3] Maven build...
-echo.
-
-set JAVA_HOME=D:\software\jdk-8
-set MAVEN_HOME=D:\software\apache-maven-3.6.3
-
-if not exist "%JAVA_HOME%\bin\java.exe" (
-    echo [FAIL] JDK not found: %JAVA_HOME%
-    pause
-    exit /b 1
-)
-if not exist "%MAVEN_HOME%\bin\mvn.cmd" (
-    echo [FAIL] Maven not found: %MAVEN_HOME%
-    pause
-    exit /b 1
+if defined JAVA_HOME (
+    if not exist "%JAVA_HOME%\bin\java.exe" (
+        echo [FAIL] JAVA_HOME does not contain bin\java.exe
+        exit /b 1
+    )
+    set "PATH=%JAVA_HOME%\bin;%PATH%"
+) else (
+    where java >nul 2>nul
+    if errorlevel 1 (
+        echo [FAIL] Set JAVA_HOME or add Java to PATH.
+        exit /b 1
+    )
 )
 
-echo JDK:    %JAVA_HOME%
-echo Maven:  %MAVEN_HOME%
-echo.
-
-call "%MAVEN_HOME%\bin\mvn.cmd" clean package -DskipTests
-if %ERRORLEVEL% neq 0 (
-    echo.
-    echo [FAIL] Maven build failed, exit code: %ERRORLEVEL%
-    pause
-    exit /b 1
+set "MAVEN_COMMAND=mvn.cmd"
+if defined MAVEN_HOME (
+    if not exist "%MAVEN_HOME%\bin\mvn.cmd" (
+        echo [FAIL] MAVEN_HOME does not contain bin\mvn.cmd
+        exit /b 1
+    )
+    set "MAVEN_COMMAND=%MAVEN_HOME%\bin\mvn.cmd"
+) else (
+    where mvn.cmd >nul 2>nul
+    if errorlevel 1 (
+        echo [FAIL] Set MAVEN_HOME or add Maven to PATH.
+        exit /b 1
+    )
 )
 
-echo.
-echo [OK] Build done
-echo.
+call "%MAVEN_COMMAND%" clean package -DskipTests
+if errorlevel 1 (
+    echo [FAIL] Maven build failed.
+    exit /b 1
+)
+for %%F in ("%JAR%" "Dockerfile" "docker-compose.yml" ".dockerignore" ".env" "application.yml" "sql\miaosha.sql") do (
+    if not exist "%%~F" (
+        echo [FAIL] Missing deploy input: %%~F
+        exit /b 1
+    )
+)
 
-REM ==================== Step 2: Collect files ====================
 echo [2/3] Collect deploy files...
-echo.
-
-set DEPLOY=target\deploy
-set JAR=target\miaosha-1.0-SNAPSHOT.jar
-
-if not exist "%JAR%" (
-    echo [FAIL] Jar not found: %JAR%
-    pause
+REM Keep validation and recursive removal in one PowerShell process.
+powershell.exe -NoProfile -Command "$ErrorActionPreference='Stop'; $root=[IO.Path]::GetFullPath($env:MIAOSHA_PACKAGE_ROOT).TrimEnd('\'); $deploy=[IO.Path]::GetFullPath($env:MIAOSHA_PACKAGE_DEPLOY); $expected=Join-Path $root 'target\deploy'; if ($deploy -ine $expected) { throw 'Unexpected deploy path' }; foreach ($path in @((Join-Path $root 'target'), $deploy)) { if (Test-Path -LiteralPath $path) { $item=Get-Item -Force -LiteralPath $path; if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Refusing to clean a linked deploy path' } } }; if (Test-Path -LiteralPath $deploy) { Remove-Item -LiteralPath $deploy -Recurse -Force }"
+if errorlevel 1 (
+    echo [FAIL] Could not safely clean target\deploy.
     exit /b 1
 )
+mkdir "%MIAOSHA_PACKAGE_DEPLOY%\logs" "%MIAOSHA_PACKAGE_DEPLOY%\sql"
+if errorlevel 1 exit /b 1
 
-if exist "%DEPLOY%" (
-    echo Clean old deploy dir...
-    rmdir /s /q "%DEPLOY%"
+call :copyFile "%JAR%" "%MIAOSHA_PACKAGE_DEPLOY%\miaosha.jar"
+if errorlevel 1 exit /b 1
+for %%F in ("Dockerfile" "docker-compose.yml" ".dockerignore" ".env" "application.yml") do (
+    call :copyFile "%%~F" "%MIAOSHA_PACKAGE_DEPLOY%\%%~F"
+    if errorlevel 1 exit /b 1
 )
-mkdir "%DEPLOY%"
-mkdir "%DEPLOY%\logs"
-mkdir "%DEPLOY%\sql"
+call :copyFile "sql\miaosha.sql" "%MIAOSHA_PACKAGE_DEPLOY%\sql\miaosha.sql"
+if errorlevel 1 exit /b 1
 
-copy /y "%JAR%"              "%DEPLOY%\miaosha.jar"          >nul && echo   [OK] miaosha.jar || echo   [FAIL] miaosha.jar
-copy /y "Dockerfile"         "%DEPLOY%\Dockerfile"           >nul && echo   [OK] Dockerfile || echo   [FAIL] Dockerfile
-copy /y "docker-compose.yml" "%DEPLOY%\docker-compose.yml"   >nul && echo   [OK] docker-compose.yml || echo   [FAIL] docker-compose.yml
-copy /y ".env"               "%DEPLOY%\.env"                 >nul && echo   [OK] .env || echo   [FAIL] .env
-copy /y "application.yml"    "%DEPLOY%\application.yml"      >nul && echo   [OK] application.yml || echo   [FAIL] application.yml
+echo [3/3] Done: target\deploy
+echo Upload the whole deploy directory, including .env and .dockerignore.
+echo Start on server: docker compose up -d
+exit /b 0
 
-echo.
-
-REM ==================== Step 3: Done ====================
-echo [3/3] Done!
-echo.
-echo ============================================================
-echo   Deploy dir: target\deploy\
-echo ============================================================
-echo.
-echo   Files:
-dir /b "%DEPLOY%"
-echo.
-echo ============================================================
-echo   Upload:
-echo     scp -r target\deploy\* xiong@SERVER:/home/xiong/miaosha/
-echo.
-echo   Start on server:
-echo     cd /home/xiong/miaosha
-echo     docker-compose up -d
-echo ============================================================
-echo.
-pause
+:copyFile
+copy /y "%~1" "%~2" >nul
+if errorlevel 1 (
+    echo [FAIL] Could not copy: %~1
+    exit /b 1
+)
+exit /b 0

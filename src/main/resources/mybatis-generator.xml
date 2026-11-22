@@ -5,8 +5,10 @@
 <generatorConfiguration>
 
     <context id="DB2Tables"    targetRuntime="MyBatis3">
-        <!--数据库链接地址账号密码-->
-        <jdbcConnection driverClass="com.mysql.jdbc.Driver" connectionURL="jdbc:mysql://127.0.0.1:3306/miaosha" userId="root" password="root">
+        <!-- 手动执行生成器时通过 -Djdbc.url / -Djdbc.username / -Djdbc.password 传入连接信息。 -->
+        <jdbcConnection driverClass="com.mysql.jdbc.Driver"
+                        connectionURL="${jdbc.url}"
+                        userId="${jdbc.username}" password="${jdbc.password}">
         </jdbcConnection>
         <!--生成DataObject类存放位置-->
         <javaModelGenerator targetPackage="com.imooc.miaoshaproject.dataobject" targetProject="src/main/java">

@@ -1,0 +1,34 @@
+item 6 iphone99
+sales 144
+stock 68
+promo_id=1 的 order： 5
+GET promo_item_stock_6：68
+
+下单失败
+stock：68
+sales：145
+promo_id=1的order：6
+
+GET promo_item_stock_6：67
+
+order:
+2026112000004900	23	6	100	1	100	1
+
+stockId:
+227767ff1f434d549db826b6c79f3b75	6	1	3
+
+Redis 库存：68 → 67
+    ↓
+写入订单、销量：144 → 145、流水更新为 2
+    ↓
+触发临时加入的 BusinessException
+    ↓
+默认 @Transactional 没有对此异常执行回滚
+MySQL 提交了订单、销量和流水
+    ↓
+Producer 捕获异常，将流水改为 3
+并回滚 MQ 半消息
+    ↓
+Consumer 收不到这条消息，MySQL 库存仍为 68
+    ↓
+接口返回下单失败

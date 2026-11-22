@@ -8,25 +8,33 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 # 构建（输出: target/miaosha-1.0-SNAPSHOT.jar）
 mvn clean package -DskipTests
 
-# 本地运行（需要 MySQL、Redis、RocketMQ NameServer/Broker）
+# 本地运行（先导出 .env；需要 MySQL、Redis、RocketMQ NameServer/Broker）
 mvn spring-boot:run
 
-# Docker：构建镜像并启动应用容器（端口 18091）
+# Docker：先打包并复制 JAR 为根目录 miaosha.jar，再启动应用（端口 18091）
 bash scripts/start-app.sh
 
-# Docker Compose：启动全部服务（MySQL + Redis + RocketMQ + Nginx + App）
-docker-compose up -d
+# Docker Compose：仅 App + MySQL，Redis / RocketMQ 需另外准备
+docker compose up -d --build
 
-# 停止全部服务
+# 停止分服务脚本创建的容器（Compose 使用 docker compose down）
 bash scripts/stop-all.sh
 ```
 
-应用运行在 **18091** 端口。Docker 启动脚本通过环境变量注入 DB/Redis/MQ 连接信息。本地 `application.yml` 硬编码连接 `182.92.116.131`（远程虚拟机）。
+应用运行在 **18091** 端口。完整演示入口是分服务脚本；Compose 不包含 Redis、RocketMQ、Nginx。Windows `package.bat` 使用 `JAVA_HOME` / `MAVEN_HOME` 或 `PATH`，生成 `target/deploy/`，部署包包含 `.env` 凭证，不提交该目录。
+
+### 配置职责
+
+- `src/main/resources/application.yml`：随 JAR 打包的基础配置及环境变量占位；Redis / Tomcat 配置类在源码 `config/` 中。
+- 根 `application.yml`：Docker 额外加载的 Tomcat / 日志覆盖配置，不重复维护 DB / Redis / MQ 连接。
+- `.env.example`：无真实凭证的模板；复制为被忽略的 `.env` 后填写实际地址与密码。
+- Compose / 分服务脚本读取 `.env` 并向应用注入环境变量；分服务 App 默认用 Docker 服务名和容器端口。
+- Spring Boot 不自动读取 `.env`。本机 Bash 需先 `set -a; . ./.env; set +a`；本机数据库 URL 使用 `SPRING_DATASOURCE_URL`，不要把 Compose 的 `mysql:3306` 当成本机地址。配置覆盖顺序与完整命令见 [README](README.md#快速开始)。
 
 ## 技术栈
 
 - **Spring Boot** 2.0.5，**MyBatis** 1.3.1，**Druid** 1.1.3 连接池
-- **Redis**（Jedis 连接池，max-active=50）+ Spring Session + Jackson JSON 序列化（Joda DateTime 支持）
+- **Redis** + Spring Session + Jackson JSON 序列化（Joda DateTime 支持）
 - **RocketMQ** 4.3.0——两个 Producer：`DefaultMQProducer`（异步消息）+ `TransactionMQProducer`（事务消息）
 - **MySQL** + MyBatis Generator 生成的 Mapper
 - **Guava** 18.0（RateLimiter、CacheBuilder），**Caffeine** 2.8.0（本地缓存）
@@ -40,7 +48,7 @@ bash scripts/stop-all.sh
 用户点击「下单」
   │
   ├─ GET  /order/generateverifycode   → 生成图形验证码，验证码字符串缓存到 Redis
-  ├─ POST /order/generatetoken        → 校验验证码 → 检查售罄标记 → 校验活动状态 → 大闸计数 -1 → 发放 UUID 令牌（Redis，5 分钟 TTL）
+  ├─ POST /order/generatetoken        → 可选验证码校验 → 检查售罄标记 → 校验活动状态 → 大闸计数 -1 → 发放 UUID 令牌（Redis，30 分钟 TTL）
   └─ POST /order/createorder          → RateLimiter 限流 → 校验令牌 → 售罄检查 → 线程池提交 → 事务 MQ → 创建订单
 ```
 
@@ -50,9 +58,11 @@ bash scripts/stop-all.sh
 |--------|----------|------|-----------|
 | 验证码 | `/generatetoken` | 防脚本，4 位字母数字混合图片 | `verify_code_{uid}` |
 | 令牌+大闸 | `/generatetoken` | 总量控制，最多发 `库存 × 5` 个令牌 | `promo_token_...`、`promo_door_count_{promoId}` |
-| RateLimiter | `/createorder` | Guava 令牌桶，N QPS 限速 | —（JVM 本地） |
-| 令牌校验 | `/createorder` | 防绕过——必须携带合法令牌 | `promo_token_{promoId}_userid_{uid}_itemid_{iid}` |
+| RateLimiter | `/createorder` | Guava 令牌桶，当前固定每实例 5 QPS | —（JVM 本地） |
+| 令牌校验 | `/createorder` | 开启大闸校验时，活动请求须携带合法令牌 | `promo_token_{promoId}_userid_{uid}_itemid_{iid}` |
 | 线程池有界队列 | `/createorder` | 并发度控制（20 线程 + 100 容量），满了 AbortPolicy 拒绝 | —（JVM 本地） |
+
+基础配置 `miaosha.verify-code=false`，其他开关及边界见 README。队列开启时 HTTP 线程仍通过 `Future.get()` 同步等待；秒杀令牌当前不会被消费，不代表一人一单。
 
 ### 库存扣减：Redis Lua 原子脚本
 
@@ -62,6 +72,7 @@ bash scripts/stop-all.sh
 local stock = redis.call('GET', KEYS[1])       -- promo_item_stock_{id}
 if not stock then return -1 end                 -- 未初始化
 stock = tonumber(stock)
+local amount = tonumber(ARGV[1])
 if stock < amount then return -2 end            -- 库存不足
 local newStock = stock - amount
 redis.call('SET', KEYS[1], newStock)
@@ -71,7 +82,7 @@ return newStock
 
 与旧 INCR 方案的关键区别：**先判再扣**——库存不足返回 -2，不碰 Redis 库存值，正常情况不需要回补。脚本通过 `DefaultRedisScript` 预编译，Spring 自动管理 EVALSHA 缓存。
 
-### 事务型 MQ + stock_log 流水表保证 Redis ↔ DB 最终一致
+### 事务型 MQ + stock_log：库存同步及已知恢复边界
 
 `MqProducer.transactionAsyncReduceStock()` 流程：
 
@@ -81,12 +92,18 @@ return newStock
    - DB：INSERT 订单 + UPDATE 销量 + UPDATE stock_log（status 1→2）
    - 注册 `TransactionSynchronizationManager.afterCompletion`：如果事务回滚 → `increaseStock`（3 次重试）
 3. 成功 → COMMIT → Consumer 收到消息 → `itemStockDOMapper.decreaseStock`（DB 库存同步）
-4. 失败 → ROLLBACK → Consumer 永远收不到
+4. 明确返回 ROLLBACK 的事务消息不会投递给 Consumer；不能把所有异常都视为已正确回滚
 5. commit 前宕机 → `checkLocalTransaction` 回查 `stock_log.status`（2=成功 COMMIT，3=失败 ROLLBACK，1=UNKNOW 继续回查）
 
 ### MQ Consumer 幂等（关键）
 
 `MqConsumer` 用 `stockLogId`（`initStockLog` 生成的 UUID）+ Redis `setIfAbsent` 做去重。RocketMQ 是 at-least-once 语义——rebalance、Broker 崩溃重启、处理超时都会触发重投。不加幂等 = 重复扣 DB 库存。
+
+当前去重是 `SETNX → EXPIRE → DB UPDATE`，并非同一事务：置位后宕机或 DB 失败会漏处理，TTL 到期后重投可能重扣；Consumer 还未检查扣库影响行数。订单 `@Transactional` 未声明受检业务异常回滚规则，Redis 回补也无幂等记录和自动对账。不得把当前实现写成“无条件保证最终一致”或“消费恰好一次”。`stock_log.status=2` 仅代表本地订单成功，不代表异步库存已同步。
+
+`stock-mode=mysql` 本身已扣 DB，后续同步 / 异步分支还有再次扣减风险；库存模式不是任意可组合。当前主演示路径为 `lua + mq-async-sync=true`。序列查询已用 `FOR UPDATE`，但私有同类调用的 `REQUIRES_NEW` 不生效，不应据此误判订单号必然重复。
+
+`miaosha.mq-async-sync=false` 会跳过 Consumer 的 DB 库存扣减，并在订单本地事务中尝试同步扣 DB；Producer / Consumer 仍会初始化，所以该开关不移除 MQ 启动依赖。
 
 ### 所有 Redis Key 汇总
 
@@ -95,11 +112,11 @@ return newStock
 | `promo_item_stock_{id}` | 缓存库存数量 | `publishPromo`（初始化）、Lua 脚本（扣减）、`increaseStock`（回补） |
 | `promo_item_stock_invalid_{id}` | 售罄标记 | Lua 脚本（库存归零时） |
 | `promo_door_count_{promoId}` | 大闸计数器，初始 = 库存×5 | `publishPromo`（初始化）、`generateSecondKillToken`（递减） |
-| `promo_token_{promoId}_userid_{uid}_itemid_{iid}` | 秒杀令牌（5 分钟 TTL） | `generateSecondKillToken` |
-| `verify_code_{uid}` | 验证码（10 分钟 TTL） | `generateverifycode` |
+| `promo_token_{promoId}_userid_{uid}_itemid_{iid}` | 秒杀令牌（30 分钟 TTL） | `generateSecondKillToken` |
+| `verify_code_{uid}` | 验证码（30 分钟 TTL） | `generateverifycode` |
 | `stock_log_synced_{stockLogId}` | MQ Consumer 幂等锁（1 小时 TTL） | `MqConsumer` |
 | `item_validate_{id}` | 商品缓存（10 分钟 TTL） | `getItemByIdInCache` |
-| `item_{id}` | 商品详情缓存（10 分钟 TTL） | `ItemController.getItem` |
+| `item_{id}` | 商品详情 Redis 缓存（30 分钟 TTL），Caffeine 300 秒 | `ItemController.getItem` |
 
 ### 已修复的 Bug
 
@@ -131,16 +148,16 @@ return newStock
 
 ## Docs 文档
 
-`docs/` 目录包含学习过程中编写的详细分析文档：
+文档统一从 [docs/README.md](docs/README.md) 进入；`my-docs/` 是待实施方案，`backup/` 是原学习和压测记录，`reference/` 是参考材料。历史参数与简历目标不能当作当前实现。
 
 | 文档 | 内容 |
 |------|------|
-| `第九十章-流量削峰防刷限流代码改动详解.md` | 第九章/第十章逐文件代码差异清单 |
-| `库存不一致问题排查与修复.md` | JMeter 测试发现 DB 多扣 → MQ Consumer 幂等修复 |
-| `Redis库存事务回退问题分析.md` | DB 事务回滚 Redis 不回补 → TransactionSync 修复 |
-| `线程池有界队列改造.md` | 无界队列 → 有界队列 + AbortPolicy |
-| `Redis-Lua原子库存扣减-方案与问题分析.md` | INCR → Lua 原子脚本迁移分析 |
-| `简历与面试-秒杀系统项目.md` | 简历条目 + 完整面试问答 |
+| `docs/backup/第九十章-流量削峰防刷限流代码改动详解.md` | 第九章/第十章逐文件代码差异清单 |
+| `docs/backup/库存不一致问题排查与修复.md` | 历史 MQ Consumer 去重改动及其背景 |
+| `docs/backup/Redis库存事务回退问题分析.md` | DB 回滚与 Redis 回补的历史分析 |
+| `docs/backup/线程池有界队列改造.md` | 无界队列 → 有界队列 + AbortPolicy |
+| `docs/backup/Redis-Lua原子库存扣减-方案与问题分析.md` | INCR → Lua 原子脚本迁移分析 |
+| `docs/backup/简历与面试-秒杀系统项目.md` | 历史简历条目与面试问答 |
 
 ## JMeter 测试方法
 
@@ -148,5 +165,6 @@ return newStock
 
 - 线程数 500，Ramp-Up 10s，循环 1 次
 - 先浏览器登录 → 拿到 token → 拿到秒杀令牌 → 填入 JMeter 参数
-- `RateLimiter.create(N)` 控制实际进入的并发量
-- 测试后对比 Redis `GET promo_item_stock_{id}` 和 MySQL `SELECT stock FROM item_stock`——**两边扣减数必须一致**
+- 当前 `RateLimiter.create(5)` 限制单实例准入速率；HTTP 总吞吐不等于业务成功吞吐
+- 使用 JSON 业务断言，记录本轮初始库存 / 订单 / 销量；等待消息收敛后对比 Redis、MySQL 扣减和成功订单购买数量增量
+- 历史 142 → 1200 QPS 尚未在当前版本复现；结构整理不等于完成可靠性改造或压测验证

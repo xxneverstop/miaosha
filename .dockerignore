@@ -1,0 +1,5 @@
+# The image needs only the prebuilt application jar.
+**
+!Dockerfile
+!.dockerignore
+!miaosha.jar

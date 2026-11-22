@@ -65,7 +65,7 @@ public class OrderServiceImpl implements OrderService {
 
 
     @Override
-    @Transactional
+    @Transactional(rollbackFor = Exception.class)
     public OrderModel createOrder(Integer userId, Integer itemId, Integer promoId, Integer amount, String stockLogId) throws BusinessException {
         //1.校验下单状态,下单的商品是否存在，用户是否合法，购买数量是否正确
         //    ItemModel itemModel = itemService.getItemById(itemId);
@@ -93,19 +93,22 @@ public class OrderServiceImpl implements OrderService {
             }
         }
 
-        //2.落单减库存
+        //2.落单减redis库存
         boolean result = itemService.decreaseStock(itemId,amount);
         if(!result){
             throw new BusinessException(EmBusinessError.STOCK_NOT_ENOUGH);
         }
 
-
+        // 当前 Lua 模式已预扣 Redis 库存，须在后续写库前登记回调，处理数据库回滚后的补偿。
+        // 此处只登记回调，不会立即回补；MySQL 事务不会自动撤销 Redis 的修改。
         TransactionSynchronizationManager.registerSynchronization(
                 new TransactionSynchronizationAdapter() {
                     @Override
+                    // Spring 在本次数据库事务提交或回滚完成后调用；本链路仍由当前下单线程执行。
                     public void afterCompletion(int status) {
+                        // status 是 Spring 的事务完成状态，与 stock_log.status 不同；仅明确回滚时回补。
                         if (status == TransactionSynchronization.STATUS_ROLLED_BACK) {
-                            // 重试 3 次
+                            // 最多尝试 3 次（含首次），成功后立即退出。
                             for (int i = 0; i < 3; i++) {
                                 try {
                                     itemService.increaseStock(itemId, amount);
@@ -117,7 +120,7 @@ public class OrderServiceImpl implements OrderService {
                                         } catch (InterruptedException ignored) {
                                         }
                                     } else {
-                                        // 3 次都失败 → 记日志，让定时对账兜底
+                                        // 3 次都失败只记录日志，保留 stockLogId 供后续核查；当前没有自动对账。
                                         log.error("Redis回补失败！itemId={}, amount={}, stockLogId={}",
                                                 itemId, amount, stockLogId, e);
                                     }
@@ -146,9 +149,10 @@ public class OrderServiceImpl implements OrderService {
         //生成交易流水号,订单号
         orderModel.setId(generateOrderNo());
         OrderDO orderDO = convertFromOrderModel(orderModel);
+        // 写入订单
         orderDOMapper.insertSelective(orderDO);
 
-        //加上商品的销量
+        // 写入销量
         itemService.increaseSales(itemId,amount);
 
         // 设置库存流水状态为成功
@@ -158,6 +162,13 @@ public class OrderServiceImpl implements OrderService {
         }
         stockLogDO.setStatus(2);   // 2 = 成功
         stockLogDOMapper.updateByPrimaryKeySelective(stockLogDO);
+
+        //// 临时故障注入：验证写入后发生业务异常时能否回滚，实验结束后删除
+        //if (itemId == 6 && amount == 1) {
+        //    System.out.println("STEP2_REPRO orderId=" + orderModel.getId()
+        //            + ", stockLogId=" + stockLogId);
+        //    throw new BusinessException(EmBusinessError.UNKNOWN_ERROR);
+        //}
 
         // mq-async-sync=false 时：同步更新 MySQL 库存（不经过 MQ），方便压测对比
         if (!mqAsyncSync) {
