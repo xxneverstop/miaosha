@@ -1,0 +1,117 @@
+“Roadmap 的 MySQL 消费记录表。 用 stockLogId 做唯一键，把「记下这笔已处理」和「扣库存」放进同一个数据库事务  ” 这个方案再介绍一下，还是不太懂，要讲清楚，数据链，那个信息到了哪里，要清晰，避免用“订单表”这种模糊名词，要用“订单表order_info”
+
+
+
+
+
+
+
+10:59
+
+
+
+
+
+用时 1分钟 16秒
+
+拿一笔下单举例。用户 23 买商品 6，买 1 件。Redis 和 MySQL 一开始都记着 10 件。这笔下单生成两个编号：订单号 O001，库存流水号 S001。下面用的是示例编号。
+第一段：创建订单，告诉后台要扣哪件商品
+顺序	数据写到哪里	写进去什么
+1	MySQL 库存流水表 stock_log	stock_log_id=S001、`item_id=6`、`amount=1`、`status=1`，表示已建流水、等待下单结果
+2	RocketMQ 的 stock_topic	消息体是 {"stockLogId":"S001","itemId":6,"amount":1}。先发半消息，等下单成功再让消费者收到
+3	Redis 的 promo_item_stock_6	预扣 1 件，Redis 库存从 10 → 9
+4	MySQL 订单表 order_info 和库存流水表 stock_log	order_info 新增订单 id=O001、`user_id=23`、`item_id=6`、`amount=1` 等字段。`stock_log` 里 S001 的状态改为 2
+
+
+下单事务提交后，`MqProducer` 确认这条消息可以投递。此时 Redis 库存是 9，MySQL 的 item_stock.stock 还是 10。消息里的 stockLogId=S001 对应 stock_log.stock_log_id。`order_info.id=O001` 是另一个编号，目前 order_info 没有 stock_log_id 列。 [消息发送代码 (line 101)](D:/workspace/dianshangmiaosha/src/main/java/com/imooc/miaoshaproject/mq/MqProducer.java:101) · [下单写入代码 (line 149)](D:/workspace/dianshangmiaosha/src/main/java/com/imooc/miaoshaproject/service/impl/OrderServiceImpl.java:149) · [订单表结构 (line 62)](D:/workspace/dianshangmiaosha/sql/miaosha.sql:62)
+第二段：后台收到消息，按 Roadmap 扣 MySQL 库存
+MqConsumer 取出消息里的 S001、`6`、`1`，交给库存消费服务。服务先用 S001 查 stock_log，核对 status=2、`item_id=6`、`amount=1`。然后在同一笔 MySQL 事务里做两次写入：
+1. 往 stock_consume_log 插入一行：`stock_log_id=S001`、`item_id=6`、`amount=1`。`stock_log_id` 是主键，所以 S001 只能登记一次。
+2. 更新 item_stock 的商品 6：把 item_stock.stock 从 10 扣到 9。确认更新了 1 行，才提交事务。提交成功后，`MqConsumer` 再告诉 RocketMQ「处理完成」。 [消费记录表和事务设计 (line 164)](D:/workspace/dianshangmiaosha/docs/my-docs/Miaosha_精简可执行_高并发交易可靠性方案.md:164)
+发生什么	S001 再来一次时会怎样
+插入 stock_consume_log 后，扣库存失败	事务回滚，`S001` 的消费记录也撤销。重投时可以重新登记、重新扣，库存最终从 10 → 9
+两步已经提交，但给 RocketMQ 的确认丢了	重投时发现 stock_consume_log 已有 S001，核对商品和数量一致后直接确认，库存保持 9
+
+
+stock_consume_log 是方案中的建议表名，目前还未实现。上面的库存数字是例子，未运行验证。
+
+      
+11:00
+
+
+
+
+
+
+
+
+所以之前的问题是用redis来避免重复投递是一个不完善的方案，因为redis中的键会过期，并且redis不能和扣库存存在同一个数据库事务里，或者说不能被数据库事务管理起来，因为如果扣库失败，redis中的防重复键不能跟着事务回滚，或者说需要自己设计回滚，而且redis键如果后续过期了，会产生误判。
+漏扣的情况：因为没有被事务管理，扣库存失败了，会回滚，但是redis键已经写了，后面重复投递时会直接判断已经扣过库存了。
+多扣的情况：又比如库存扣库成功的情况，但是重复投递时redis可能过期了，就可能会多扣。
+
+我的理解有问题没有。
+
+所以这个方案设计的关键理念是什么？我的理解是：增加了stock_consume_log  数据表，把它的更新插入和扣数据库库存放在一个mq消费者的数据库事务中，就是说给消费者扣库存这个逻辑中在添加一个前置检查，避免消息一重投消费者就不管三七二十一就直接扣库存。但是能解决问题确保不出问题吗，为什么能以及为什么不能？
+
+（用我的语言风格回答我，因为我自己输出的语言是我自己最方便懂的风格）
+
+
+
+
+
+
+
+11:38
+
+
+
+
+
+你的理解基本对。两个地方可以说得更准一点：
+- Redis 这个键是为了让消费者别重复扣库存。RocketMQ 还是可以把同一条消息再投一次。
+- 漏扣也不用非得发生「数据库回滚」。只要 item_stock.stock 没扣成功，Redis 的键却已经写了，重投时消费者就可能误以为已经扣过，直接跳过。多扣你理解得对，第一次扣成功了，重投时键刚好过期，就可能再扣一次。
+这个方案的关键是什么？
+你说的「给扣库存加个前置检查」方向对。具体做法是先用 stockLogId 去插 stock_consume_log，让 MySQL 的唯一键决定这次能不能扣。如果只是先查有没有，两次重投同时来，都有可能查到「没有」，然后各扣一次。
+
+比如同一条消息的 stockLogId 是 S001。消费者把插入 stock_consume_log 的 S001 记录和**扣减 item_stock.stock**放进同一笔 MySQL 事务。
+- 第一次扣库失败，`S001` 的记录也一起回滚。后面重投时还能重新插、重新扣。
+- 第一次扣库成功并提交，`S001` 的记录也一起留下来。后面重投时，同一个 S001 插不进去，核对已有记录后就直接确认，库存不会再扣一次。
+能保证到什么程度？
+它能保证同一个 stockLogId 最多成功扣一次，前提是两步确实在同一笔事务里，扣成功才提交，提交后才告诉 RocketMQ「处理完成」，而且消费记录还保留着。
+
+「最多扣一次」和「一定能扣成」是两件事。比如 MySQL 一直不可用，消息重试完了也可能一次都没扣成。另外，用户点两次下单，如果系统生成了两个不同的 stockLogId，这个方案会当成两笔分别处理。
+
+stock_consume_log 目前还是方案中的表，以上是它的设计保证，尚未跑重投测试。
+
+      
+11:38
+
+
+
+
+
+
+
+
+这是最佳方案吗
+
+
+
+
+
+
+
+11:42
+
+
+
+
+
+对这个项目现在的目标，我会选 stock_consume_log。 MySQL 本来就要更新 item_stock，把消费记录也放进同一笔 MySQL 事务，就能一起提交、一起回滚。这样同时解决了 Redis 标记带来的漏扣和过期后的多扣。
+
+也可以复用 stock_log，加一个独立的 sync_status 字段，把「更新同步状态」和「扣库存」放进同一笔事务，正确性可以做到一样。我更倾向新表，是因为 stock_log.status 已经在记录下单结果，新表单独记录 MySQL 库存确实扣过了，后面排查和对账更直接。
+
+所以，对当前项目我推荐新表。它会多写一条 MySQL 记录，吞吐影响还没实测。
+
+      
+11:42
