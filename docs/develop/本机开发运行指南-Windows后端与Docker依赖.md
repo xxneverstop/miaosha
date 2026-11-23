@@ -29,7 +29,7 @@ flowchart LR
     M --> A
 ```
 
-日常改 Java，只需要在 IDEA 中重启后端；修改 HTML，刷新页面即可。数据库和消息队列可以继续运行。完整容器方案需要额外打包 JAR、构建镜像和重建应用容器，更适合部署演示。项目 [Roadmap](../roadmap.md#32-推荐的默认布局) 也采用这一日常开发布局。
+日常改 Java，只需要在 IDEA 中重启后端；修改 HTML，刷新页面即可。数据库和消息队列可以继续运行。完整容器方案需要额外打包 JAR、构建镜像和重建应用容器，更适合部署演示。项目 [Roadmap](../roadmap/roadmap.md#32-推荐的默认布局) 也采用这一日常开发布局。
 
 ### 1.2 Ubuntu 是否必须安装
 
@@ -531,7 +531,7 @@ docker logs --tail 100 miaosha-rocketmq-broker
 仓库依据：
 
 - [项目 README](../../README.md)：本机 Maven 入口、接口、当前实现边界。
-- [项目 Roadmap](../roadmap.md)：本机开发与云端部署分开。
+- [项目 Roadmap](../roadmap/roadmap.md)：本机开发与云端部署分开。
 - [基础 application.yml](../../src/main/resources/application.yml)：连接环境变量、端口、Redis DB 10 和功能开关。
 - [MySQL 启动脚本](../../scripts/start-mysql.sh)、[Redis 启动脚本](../../scripts/start-redis.sh)、[RocketMQ 启动脚本](../../scripts/start-rocketmq.sh)：镜像、网络、容器名和基础参数来源。
 - [MqProducer](../../src/main/java/com/imooc/miaoshaproject/mq/MqProducer.java)：两个 Producer 未关闭 VIP 通道。

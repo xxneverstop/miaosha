@@ -9,7 +9,7 @@ build_log: "docs/build-logs/2026-11-22-01-mq-stock-consume-idempotency.md"
 
 # 用 MySQL 消费记录修复 MQ 库存漏扣和多扣
 
-> 草案，待审查。对应 [Roadmap 第 2 步第 2 项](../roadmap.md#5-第-2-步修复订单与-mq-的正确性)。
+> 草案，待审查。对应 [Roadmap 第 2 步第 2 项](../roadmap/roadmap.md#5-第-2-步修复订单与-mq-的正确性)。
 
 ## 1. 先看结论
 
@@ -36,7 +36,7 @@ Redis 标记只能说明消费者开始处理过。新表 `stock_consume_log` �
 
 `stock_log.status=2` 记录的是本地下单阶段成功。此时 `item_stock.stock` 可能还在等消费扣减。当前 `order_info` 没有 `stock_log_id` 字段，消费时用消息里的 `stockLogId` 对应 `stock_log.stock_log_id`。 [生成库存流水](../../src/main/java/com/imooc/miaoshaproject/service/impl/ItemServiceImpl.java#L177) · [事务消息](../../src/main/java/com/imooc/miaoshaproject/mq/MqProducer.java#L103) · [写入订单和状态](../../src/main/java/com/imooc/miaoshaproject/service/impl/OrderServiceImpl.java#L149) · [表结构](../../sql/miaosha.sql#L62)
 
-本次改造聚焦 `MqConsumer` 的 MySQL 扣库。该路径纳入 Roadmap 第 3 项的零行检查。其他扣库调用、库存模式组合、Redis 预扣与回补、HTTP 重试和新增 `order_info` 与 `stock_log` 的持久关联，交由 Roadmap 对应任务处理。 [Roadmap](../roadmap.md)
+本次改造聚焦 `MqConsumer` 的 MySQL 扣库。该路径纳入 Roadmap 第 3 项的零行检查。其他扣库调用、库存模式组合、Redis 预扣与回补、HTTP 重试和新增 `order_info` 与 `stock_log` 的持久关联，交由 Roadmap 对应任务处理。 [Roadmap](../roadmap/roadmap.md)
 
 ## 3. 方案怎么工作
 
