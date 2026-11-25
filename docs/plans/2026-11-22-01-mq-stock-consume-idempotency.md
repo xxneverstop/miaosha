@@ -1,15 +1,15 @@
 ---
 plan_id: "2026-11-22-01-mq-stock-consume-idempotency"
 title: "用 MySQL 消费记录修复 MQ 库存漏扣和多扣"
-status: draft
+status: completed
 created_at: "2026-11-22"
-updated_at: "2026-11-22"
+updated_at: "2026-11-23"
 build_log: "docs/build-logs/2026-11-22-01-mq-stock-consume-idempotency.md"
 ---
 
 # 用 MySQL 消费记录修复 MQ 库存漏扣和多扣
 
-> 草案，待审查。对应 [Roadmap 第 2 步第 2 项](../roadmap/roadmap.md#5-第-2-步修复订单与-mq-的正确性)。
+> 已完成代码和隔离验收。对应 [Roadmap 第 2 步第 2 项](../roadmap/roadmap.md#5-第-2-步修复订单与-mq-的正确性)。实测结果见 [Build Log](../build-logs/2026-11-22-01-mq-stock-consume-idempotency.md)。
 
 ## 1. 先看结论
 
@@ -107,22 +107,22 @@ CREATE TABLE IF NOT EXISTS stock_consume_log (
 
 ### 第 1 步：准备隔离环境并复现旧问题
 
-- [ ] 在 JDK 8 下记录 Git 基线和已有工作区改动。用单独的测试库、Redis 和独占测试 Broker，开 `lua + mq-async-sync=true`。每轮用新流水号和库存充足的测试商品，从 `item_stock.stock=10` 开始，只下一单买 `1` 件。
-- [ ] **漏扣复现**。在旧 `MqConsumer` 设置 Redis TTL 后、调用扣库 SQL 前，针对首次消费临时返回 `RECONSUME_LATER`。保留 1 小时 TTL。记录第二次相同 `stockLogId` 因标记存在跳过，`item_stock.stock` 仍为 `10`。
-- [ ] **多扣复现**。旧代码把该场景的标记 TTL 临时改为 1 秒。首次扣库成功后、确认前临时返回 `RECONSUME_LATER`。确认重试到达前标记已经过期，记录同一个 `stockLogId` 两次扣减后 `item_stock.stock=8`。每轮保留首次与重投日志。实验改动单独撤回或留在隔离实验副本。
+- [x] 在 JDK 8 下记录 Git 基线和已有工作区改动。用单独的测试库、Redis 和独占测试 Broker，开 `lua + mq-async-sync=true`。每轮用新流水号和库存充足的测试商品，从 `item_stock.stock=10` 开始，只下一单买 `1` 件。
+- [x] **漏扣复现**。在旧 `MqConsumer` 设置 Redis TTL 后、调用扣库 SQL 前，针对首次消费临时返回 `RECONSUME_LATER`。保留 1 小时 TTL。记录第二次相同 `stockLogId` 因标记存在跳过，`item_stock.stock` 仍为 `10`。
+- [x] **多扣复现**。旧代码把该场景的标记 TTL 临时改为 1 秒。首次扣库成功后、确认前临时返回 `RECONSUME_LATER`。确认重试到达前标记已经过期，记录同一个 `stockLogId` 两次扣减后 `item_stock.stock=8`。每轮保留首次与重投日志。实验改动单独撤回或留在隔离实验副本。
 - **完成标志**。两轮分别有业务流水号、Redis 标记状态和 MySQL 前后快照，可复核是同一条消息的变化。
 
 ### 第 2 步：先建表，再完成数据库事务
 
-- [ ] 应用增量 SQL。用 `SHOW CREATE TABLE stock_consume_log` 和 `SHOW CREATE TABLE item_stock` 核对 InnoDB、主键与商品索引。保证已有 `order_info`、`stock_log` 和库存数据不被初始化脚本覆盖。
-- [ ] 实现 Mapper 和 `StockConsumeService.consumeOnce`。在真实 MySQL 上先跑首次消费、顺序重投、主键并发竞争、扣库更新 0 行与回滚测试。
+- [x] 应用增量 SQL。用 `SHOW CREATE TABLE stock_consume_log` 和 `SHOW CREATE TABLE item_stock` 核对 InnoDB、主键与商品索引。保证已有 `order_info`、`stock_log` 和库存数据不被初始化脚本覆盖。
+- [x] 实现 Mapper 和 `StockConsumeService.consumeOnce`。在真实 MySQL 上先跑首次消费、顺序重投、主键并发竞争、扣库更新 0 行与回滚测试。
 - **完成标志**。一笔流水最多留下 1 条已提交的消费记录。扣库和记录对外同时生效，任何一项失败时，两项都能回滚。
 
 ### 第 3 步：接入 RocketMQ 并回归旧故障
 
-- [ ] 接入新服务，移除 `MqConsumer` 对 `stock_log_synced_*` 的读写，保留 RocketMQ 启动、订阅和同步开关语义。
-- [ ] 在真实 Broker 上验证「第一次写记录后失败，重投后扣成」以及「第一次提交后未确认，重投时跳过」。测试故障通过测试夹具或隔离实验副本触发，发布代码只保留正常消费逻辑。
-- [ ] 更新运行文档。记录测试命令、退出码、测试数据、消息日志和查询结果，最后核对 Git diff。
+- [x] 接入新服务，移除 `MqConsumer` 对 `stock_log_synced_*` 的读写，保留 RocketMQ 启动、订阅和同步开关语义。
+- [x] 在真实 Broker 上验证「第一次写记录后失败，重投后扣成」以及「第一次提交后未确认，重投时跳过」。测试故障通过测试夹具或隔离实验副本触发，发布代码只保留正常消费逻辑。
+- [x] 更新运行文档。记录测试命令、退出码、测试数据、消息日志和查询结果，最后核对 Git diff。
 - **完成标志**。两种故障恢复后，测试订单只增加 1 行，`item_stock.stock` 都为 `9`，`stock_consume_log` 对应流水都只有 1 行。
 
 ## 6. 如何测试、怎样算完成
@@ -148,9 +148,9 @@ mvn '-Dtest=StockConsumeMySqlIT' test
 mvn clean package
 ```
 
-- [ ] 新旧两轮对比记录了 `stockLogId`、消息处理结果、`item_stock.stock` 和实际消费记录。抽查真实下单时同时比对 Redis 库存及 `order_info` 增量。
-- [ ] 正常、重投和失败的库存变化符合上表。尤其保留「扣库后抛错」「提交后重投」两份可复核证据。
-- [ ] Maven 构建、原有回归与真实 MySQL 及 MQ 验证结果分别记录。吞吐留给实际压测。
+- [x] 新旧两轮对比记录了 `stockLogId`、消息处理结果、`item_stock.stock` 和实际消费记录。抽查真实下单时同时比对 Redis 库存及 `order_info` 增量。
+- [x] 正常、重投和失败的库存变化符合上表。尤其保留「扣库后抛错」「提交后重投」两份可复核证据。
+- [x] Maven 构建、原有回归与真实 MySQL 及 MQ 验证结果分别记录。吞吐留给实际压测。
 
 ## 7. 风险与回滚
 
@@ -176,4 +176,4 @@ SELECT item_id, stock FROM item_stock WHERE item_id = 6;
 
 - 审查消费事务是否通过 Spring 代理，主键冲突分支是否核对载荷，扣库更新 0 行是否回滚。
 - 审查旧消息切换和回退边界。首次验收按本机隔离环境准备，具体测试库、Broker 地址执行时核定。
-- 当前状态为待审查。收到明确按本计划实施的请求后，开始代码和测试改造。
+- 当前状态为已完成，执行证据见 [Build Log](../build-logs/2026-11-22-01-mq-stock-consume-idempotency.md)。

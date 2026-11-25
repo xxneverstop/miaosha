@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.imooc.miaoshaproject.dao.StockConsumeLogMapper">
+  <resultMap id="StockConsumeLogResult" type="com.imooc.miaoshaproject.dataobject.StockConsumeLogDO">
+    <id column="stock_log_id" property="stockLogId" />
+    <result column="item_id" property="itemId" />
+    <result column="amount" property="amount" />
+  </resultMap>
+
+  <insert id="insert" parameterType="com.imooc.miaoshaproject.dataobject.StockConsumeLogDO">
+    insert into stock_consume_log (stock_log_id, item_id, amount)
+    values (#{stockLogId}, #{itemId}, #{amount})
+  </insert>
+
+  <select id="selectByStockLogIdForShare" resultMap="StockConsumeLogResult">
+    select stock_log_id, item_id, amount
+    from stock_consume_log
+    where stock_log_id = #{stockLogId}
+    lock in share mode
+  </select>
+</mapper>

@@ -2,6 +2,13 @@
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
+## 开发约定
+
+- 所有新增或修改的代码都遵循 **Ponytail** 原则。优先复用现有实现和依赖，用最小且完整的改动满足需求，保留必要的校验和错误处理。
+- 新增或修改源码时，每个涉及的生产代码和测试代码文件都要有文件级说明，写清文件的职责、在流程中的位置以及主要依赖或验证范围。
+- 为文件中的每个函数或方法写简洁易懂的说明，交代用途，按需说明关键输入、返回结果、副作用或失败行为。对关键步骤就地说明为什么这样做、涉及的数据和依赖、约束与异常分支。测试代码要讲清场景、测试数据或故障如何构造，以及断言证明了什么。简短方法可用一句，避免逐行复述代码。
+- 任务涉及库或 API 文档、代码生成、环境搭建或配置步骤时，主动使用 **Context7**，按项目实际使用的版本核对文档，无需用户另行提醒。
+
 ## 构建与运行
 
 ```bash
@@ -97,9 +104,9 @@ return newStock
 
 ### MQ Consumer 幂等（关键）
 
-`MqConsumer` 用 `stockLogId`（`initStockLog` 生成的 UUID）+ Redis `setIfAbsent` 做去重。RocketMQ 是 at-least-once 语义——rebalance、Broker 崩溃重启、处理超时都会触发重投。不加幂等 = 重复扣 DB 库存。
+`MqConsumer` 调用独立事务服务 `StockConsumeService.consumeOnce`。服务以 `stock_consume_log.stock_log_id` 唯一键判重，在同一 MySQL 事务内插入消费记录、条件更新 `item_stock`。库存更新影响 1 行才提交，消费者在事务提交后确认消息。已提交的重复记录需核对商品和数量，失败请求由 RocketMQ 重试。
 
-当前去重是 `SETNX → EXPIRE → DB UPDATE`，并非同一事务：置位后宕机或 DB 失败会漏处理，TTL 到期后重投可能重扣；Consumer 还未检查扣库影响行数。订单 `@Transactional` 未声明受检业务异常回滚规则，Redis 回补也无幂等记录和自动对账。不得把当前实现写成“无条件保证最终一致”或“消费恰好一次”。`stock_log.status=2` 仅代表本地订单成功，不代表异步库存已同步。
+`stock_log.status=2` 仅代表本地订单成功。已提交的 `stock_consume_log` 记录才证明异步库存同步完成。已有库需先应用 `sql/upgrade-001-stock-consume-log.sql` 并核查历史消息。Redis 回补的幂等和跨进程恢复仍待处理。
 
 `stock-mode=mysql` 本身已扣 DB，后续同步 / 异步分支还有再次扣减风险；库存模式不是任意可组合。当前主演示路径为 `lua + mq-async-sync=true`。序列查询已用 `FOR UPDATE`，但私有同类调用的 `REQUIRES_NEW` 不生效，不应据此误判订单号必然重复。
 
@@ -114,7 +121,6 @@ return newStock
 | `promo_door_count_{promoId}` | 大闸计数器，初始 = 库存×5 | `publishPromo`（初始化）、`generateSecondKillToken`（递减） |
 | `promo_token_{promoId}_userid_{uid}_itemid_{iid}` | 秒杀令牌（30 分钟 TTL） | `generateSecondKillToken` |
 | `verify_code_{uid}` | 验证码（30 分钟 TTL） | `generateverifycode` |
-| `stock_log_synced_{stockLogId}` | MQ Consumer 幂等锁（1 小时 TTL） | `MqConsumer` |
 | `item_validate_{id}` | 商品缓存（10 分钟 TTL） | `getItemByIdInCache` |
 | `item_{id}` | 商品详情 Redis 缓存（30 分钟 TTL），Caffeine 300 秒 | `ItemController.getItem` |
 
@@ -135,7 +141,8 @@ return newStock
 | `service/impl/ItemServiceImpl.java` | Lua 库存脚本、`increaseStock` 回补、`initStockLog` 流水初始化 |
 | `service/impl/PromoServiceImpl.java` | `generateSecondKillToken`（令牌+大闸）、`publishPromo`（库存预热+大闸初始化） |
 | `mq/MqProducer.java` | 事务 + 异步 RocketMQ Producer，`TransactionListener` 实现 |
-| `mq/MqConsumer.java` | 库存同步消费者，`setIfAbsent` 幂等 |
+| `mq/MqConsumer.java` | 校验库存消息，提交后确认，失败时请求重试 |
+| `service/impl/StockConsumeService.java` | MySQL 消费记录和库存扣减同事务，按库存流水号判重 |
 
 ### 支撑文件
 

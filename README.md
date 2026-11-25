@@ -125,17 +125,17 @@ sequenceDiagram
     alt 本地事务成功
         S-->>MQ: COMMIT_MESSAGE
         MQ->>W: 投递库存同步消息
-        W->>R: SETNX stock_log_synced_{stockLogId}
-        W->>DB: 条件扣减 item_stock
+        W->>DB: 同一事务写 stock_consume_log 并条件扣减 item_stock
+        W-->>MQ: 提交后确认消费，失败时请求重试
     else 本地事务实际回滚
         S->>R: afterCompletion 回补库存，最多尝试 3 次
         S-->>MQ: 业务异常分支返回 ROLLBACK_MESSAGE
     end
 ```
 
-Broker 回查 `stock_log`：`2` 返回 COMMIT，`1` 或记录不存在返回 UNKNOWN，其他状态返回 ROLLBACK。生产者捕获 `BusinessException` 时将流水更新为 `3`。消费者使用 `stockLogId` 构造 Redis 去重 Key，设置 1 小时过期后执行数据库库存更新。
+Broker 回查 `stock_log` 时，`2` 返回 COMMIT，`1` 或记录不存在返回 UNKNOWN，其他状态返回 ROLLBACK。生产者捕获 `BusinessException` 时将流水更新为 `3`。消费者核对消息与已下单的 `stock_log`，再以 `stock_consume_log.stock_log_id` 主键区分首次扣库与重投。
 
-这些机制用于协调订单与库存同步，但 Redis 去重与数据库更新不在同一事务，不能据此无条件宣称最终一致。消费失败恢复、异常回滚语义等限制见[当前实现边界](#当前实现边界)。源码中尚无定时对账任务。
+消费记录和库存更新一起提交。重复消息的商品与数量和已提交的消费记录一致时，消费者直接确认。扣库更新 0 行或其他事务失败时回滚并请求重试。超出重试上限的消息需要从死信队列核查。 [当前实现边界](#当前实现边界)
 
 ## 快速开始
 
@@ -185,7 +185,7 @@ bash scripts/start-nginx.sh
 bash scripts/status.sh
 ```
 
-MySQL 脚本会在数据卷首次初始化时导入 [sql/miaosha.sql](sql/miaosha.sql)，其中包含 `DROP TABLE` 和演示数据，只应用于允许重建的测试库。已有数据卷不会重新导入。Dockerfile 的构建输入是根目录 `miaosha.jar`，每次修改 Java 代码后都需要重新打包并复制。
+MySQL 会在新数据卷中依次导入 [基础 SQL](sql/miaosha.sql) 和 [消费记录表增量 SQL](sql/upgrade-001-stock-consume-log.sql)。基础 SQL 含 `DROP TABLE` 和演示数据，适用于允许重建的测试库。已有库升级前核对数据库、旧消费位点、延迟重试、半消息和死信，单独执行增量 SQL。旧 Redis 标记和 `stock_log.status=2` 无法证明某笔 MySQL 库存已经扣减，历史消息须先核查再决定是否重放。Dockerfile 的构建输入是根目录 `miaosha.jar`，每次修改 Java 代码后都需要重新打包并复制。
 
 | 服务 | 宿主机端口 | 容器端口 |
 | --- | --- | --- |
@@ -223,7 +223,7 @@ Compose 与分服务脚本的数据库数据卷不同，也会争用部分容器
 
 ### 4. 本机 Maven 运行
 
-先准备 MySQL、Redis、RocketMQ，并在隔离测试库中导入 `sql/miaosha.sql`。本机访问分服务脚本启动的依赖时，MySQL 使用 `127.0.0.1:13306`、Redis 使用 `127.0.0.1:16379`、NameServer 使用 `127.0.0.1:19876`，Broker 通告地址还须能从本机访问。
+先准备 MySQL、Redis、RocketMQ。在全新隔离测试库中依次执行 `sql/miaosha.sql` 和 `sql/upgrade-001-stock-consume-log.sql`。本机访问分服务脚本启动的依赖时，MySQL 使用 `127.0.0.1:13306`、Redis 使用 `127.0.0.1:16379`、NameServer 使用 `127.0.0.1:19876`，Broker 通告地址还须能从本机访问。
 
 先检查 `.env` 中本机使用的 `SPRING_DATASOURCE_URL`、Redis 地址及 MQ 地址；`MYSQL_HOST` / `MYSQL_PORT` 用于 Compose，不能直接视为本机数据库地址。Bash 中手动导出配置后运行：
 
@@ -327,6 +327,8 @@ curl -X POST 'http://localhost:18091/order/createorder?token=<登录token>' \
 
 **库存开关并非任意组合都可用。** 默认 `lua + mq-async-sync=true` 执行一次 Redis 扣减、一次消费者 DB 扣减；`lua + false` 执行 Redis 扣减、订单事务内 DB 扣减。当前 `mysql` 模式本身已经扣过数据库库存，后续同步或异步分支还会再尝试扣一次，不能直接把它当作正确的 MySQL 基线。切换实验模式前需梳理重复扣减和补偿分支。
 
+同一消费组的实例使用相同的 `mq-async-sync` 设置。切换前冻结新订单，核查在途消息、延迟重试、半消息和历史重放范围。需要同时保留两种模式时，使用隔离的 Topic 和消费组或独占 Broker。新版已扣库的消息交给旧消费者重放，仍可能重复扣减。 [切换与回退说明](docs/plans/2026-11-22-01-mq-stock-consume-idempotency.md#7-风险与回滚)
+
 ## 数据模型与 Redis Key
 
 | MySQL 表 | 用途 |
@@ -336,6 +338,7 @@ curl -X POST 'http://localhost:18091/order/createorder?token=<登录token>' \
 | `promo` | 商品活动、起止时间与活动价格 |
 | `order_info` | 用户、商品、活动、购买数量与成交金额 |
 | `stock_log` | UUID 库存流水；1 初始、2 下单成功、3 失败标记 |
+| `stock_consume_log` | 已提交的异步库存扣减凭证，`stock_log_id` 为主键，记录商品、数量和时间 |
 | `sequence_info` | 订单号序列，查询使用 `SELECT ... FOR UPDATE` |
 
 订单号由日期、补齐到 6 位的数据库序列和固定后缀 `00` 拼接。表字段定义见 [初始化 SQL](sql/miaosha.sql)，实际库存更新使用 `WHERE item_id = ? AND stock >= ?` 防止单次 SQL 把数据库库存减为负数。
@@ -348,7 +351,6 @@ curl -X POST 'http://localhost:18091/order/createorder?token=<登录token>' \
 | `promo_door_count_{promoId}` | 令牌大闸，发布时库存 × 5，无显式 TTL |
 | `promo_item_stock_{iid}` | Redis 可售库存，无显式 TTL |
 | `promo_item_stock_invalid_{iid}` | 售罄标记，回补或发布时清除，无显式 TTL |
-| `stock_log_synced_{stockLogId}` | 消费去重，1 小时 |
 | `item_{iid}` | 商品详情，30 分钟；Caffeine 同名 Key 为 300 秒 |
 | `item_validate_{iid}` | 下单商品校验缓存，10 分钟 |
 | `user_calidate_{uid}` | 当前源码实际读写的用户校验 Key；TTL 存在拼写错误，见下文 |
@@ -390,9 +392,9 @@ Redis 初始库存 - Redis 剩余库存
 
 | 项目 | 当前行为与限制 |
 | --- | --- |
-| 消费幂等 | Redis `setIfAbsent` 后才扣 DB；加锁、设置 TTL、扣库不是同一原子事务。拿到锁后宕机或 DB 失败可能导致重投被跳过，锁过期后的重投也可能再次扣库；尚无数据库唯一消费记录 |
-| DB 库存同步 | Consumer 未检查 `decreaseStock` 的影响行数；可能在更新 0 行时仍确认消费成功 |
-| 事务回滚 | `BusinessException` 继承受检 `Exception`，`createOrder` 的 `@Transactional` 未声明 `rollbackFor`；不能假设所有业务异常都触发回滚。Redis 补偿回调只在事务实际回滚时执行 |
+| 消费幂等 | 异步消费者以 `stock_log_id` 判重，与 MySQL 库存扣减同事务。已提交的消费记录需保留到允许重放的窗口之后 |
+| DB 库存同步 | 异步消费者检查更新行数并对失败请求重试。同步分支仍有行数检查和库存模式组合的边界；积压和死信仍需核查 |
+| 事务回滚 | `createOrder` 声明 `rollbackFor = Exception.class`，覆盖受检业务异常。Redis 补偿回调在本地事务明确回滚时执行 |
 | Redis 补偿 | `increaseStock` 的 INCR 与删除售罄标记分开执行；重试缺少补偿幂等记录，进程崩溃或重试也有恢复窗口。补偿失败只记录日志，尚无自动对账任务 |
 | 一人一单与请求幂等 | 尚未实现；秒杀令牌不会在下单后消费，允许同一用户重复下单；大闸限制令牌发放次数，不能限制令牌被使用的总次数 |
 | 缓存一致性 | 没有主动失效和跨实例本地缓存广播；库存、销量、活动状态可能在 TTL 内陈旧。用户缓存读写 `user_calidate_`，过期设置却使用 `user_validate_`，实际 Key 未被设置 TTL |

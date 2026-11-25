@@ -5,12 +5,15 @@ import com.imooc.miaoshaproject.dao.StockLogDOMapper;
 import com.imooc.miaoshaproject.dataobject.StockLogDO;
 import com.imooc.miaoshaproject.error.BusinessException;
 import com.imooc.miaoshaproject.service.OrderService;
+import com.imooc.miaoshaproject.service.model.OrderModel;
 import org.apache.rocketmq.client.exception.MQBrokerException;
 import org.apache.rocketmq.client.exception.MQClientException;
 import org.apache.rocketmq.client.producer.*;
 import org.apache.rocketmq.common.message.Message;
 import org.apache.rocketmq.common.message.MessageExt;
 import org.apache.rocketmq.remoting.exception.RemotingException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -25,6 +28,8 @@ import java.util.Map;
  */
 @Component
 public class MqProducer {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(MqProducer.class);
 
     private DefaultMQProducer producer;
 
@@ -64,7 +69,9 @@ public class MqProducer {
                 Integer amount = (Integer) ((Map)arg).get("amount");
                 String stockLogId = (String) ((Map)arg).get("stockLogId");
                 try {
-                    orderService.createOrder(userId,itemId,promoId,amount,stockLogId);
+                    OrderModel order = orderService.createOrder(userId,itemId,promoId,amount,stockLogId);
+                    LOGGER.info("Order committed, userId={}, orderId={}, stockLogId={}",
+                            userId, order.getId(), stockLogId);
                 } catch (BusinessException e) {
                     e.printStackTrace();
                     //设置对应的stockLog为回滚状态

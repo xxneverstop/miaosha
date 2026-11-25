@@ -1,30 +1,40 @@
 package com.imooc.miaoshaproject.mq;
 
-import com.alibaba.fastjson.JSON;
-import com.imooc.miaoshaproject.dao.ItemStockDOMapper;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.imooc.miaoshaproject.service.impl.StockConsumeService;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.rocketmq.client.consumer.DefaultMQPushConsumer;
 import org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyContext;
 import org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyStatus;
 import org.apache.rocketmq.client.consumer.listener.MessageListenerConcurrently;
 import org.apache.rocketmq.client.exception.MQClientException;
 import org.apache.rocketmq.common.message.MessageExt;
-import org.springframework.beans.factory.annotation.Autowired;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.PostConstruct;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
-/**
- * Created by hzllb on 2019/2/23.
- */
 @Component
-public class MqConsumer {
+public class MqConsumer implements MessageListenerConcurrently {
 
-    private DefaultMQPushConsumer consumer;
+    private static final Logger LOGGER = LoggerFactory.getLogger(MqConsumer.class);
+    // 拒绝有歧义的 JSON，并从解析异常的位置描述中移除原始消息。
+    private static final ObjectMapper MESSAGE_MAPPER = new ObjectMapper()
+            .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+            .enable(DeserializationFeature.FAIL_ON_READING_DUP_TREE_KEY)
+            .disable(JsonParser.Feature.INCLUDE_SOURCE_IN_LOCATION);
+
+    private final StockConsumeService stockConsumeService;
+    private final boolean mqAsyncSync;
 
     @Value("${mq.nameserver.addr}")
     private String nameAddr;
@@ -32,51 +42,63 @@ public class MqConsumer {
     @Value("${mq.topicname}")
     private String topicName;
 
-    @Autowired
-    private ItemStockDOMapper itemStockDOMapper;
-
-    @Autowired
-    private RedisTemplate redisTemplate;
-
-    @Value("${miaosha.mq-async-sync:true}")
-    private boolean mqAsyncSync;
+    public MqConsumer(StockConsumeService stockConsumeService,
+                      @Value("${miaosha.mq-async-sync:true}") boolean mqAsyncSync) {
+        this.stockConsumeService = stockConsumeService;
+        this.mqAsyncSync = mqAsyncSync;
+    }
 
     @PostConstruct
     public void init() throws MQClientException {
-        consumer = new DefaultMQPushConsumer("stock_consumer_group");
+        DefaultMQPushConsumer consumer = new DefaultMQPushConsumer("stock_consumer_group");
         consumer.setNamesrvAddr(nameAddr);
         consumer.subscribe(topicName, "*");
-
-        consumer.registerMessageListener(new MessageListenerConcurrently() {
-            @Override
-            public ConsumeConcurrentlyStatus consumeMessage(List<MessageExt> msgs,
-                                                            ConsumeConcurrentlyContext context) {
-                for (MessageExt msg : msgs) {
-                    String jsonString = new String(msg.getBody());
-                    Map<String, Object> map = JSON.parseObject(jsonString, Map.class);
-                    Integer itemId = (Integer) map.get("itemId");
-                    Integer amount = (Integer) map.get("amount");
-                    String stockLogId = (String) map.get("stockLogId");
-
-                    // 幂等：Redis setIfAbsent 防重复消费
-                    String lockKey = "stock_log_synced_" + stockLogId;
-                    Boolean firstTime = redisTemplate.opsForValue().setIfAbsent(lockKey, "1");
-                    if (Boolean.FALSE.equals(firstTime)) {
-                        // 已处理过，跳过
-                        continue;
-                    }
-                    // setIfAbsent 成功后单独设过期时间
-                    redisTemplate.expire(lockKey, 1, TimeUnit.HOURS);
-
-                    // 真正扣减数据库库存（mq-async-sync=false 时跳过，已同步扣）
-                    if (mqAsyncSync) {
-                        itemStockDOMapper.decreaseStock(itemId, amount);
-                    }
-                }
-                return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
-            }
-        });
-
+        consumer.registerMessageListener(this);
         consumer.start();
+    }
+
+    @Override
+    public ConsumeConcurrentlyStatus consumeMessage(List<MessageExt> messages, ConsumeConcurrentlyContext context) {
+        // 同步模式在下单事务内扣库，监听器只确认消息。
+        if (!mqAsyncSync) {
+            return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
+        }
+
+        for (MessageExt message : messages) {
+            String stockLogId = null;
+            try {
+                String json = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(message.getBody())).toString();
+                JsonNode payload = MESSAGE_MAPPER.readTree(json);
+                if (payload == null || !payload.isObject()) {
+                    throw new IllegalArgumentException("Stock message must contain a JSON object");
+                }
+                String id = payload.path("stockLogId").textValue();
+                if (StringUtils.isBlank(id) || id.length() > 64) {
+                    throw new IllegalArgumentException("stockLogId must be a non-blank string of at most 64 characters");
+                }
+                stockLogId = id;
+                int itemId = positiveInt(payload, "itemId");
+                int amount = positiveInt(payload, "amount");
+                // Spring 事务代理完成提交后才返回，消费者随后才能确认成功。
+                stockConsumeService.consumeOnce(stockLogId, itemId, amount);
+            } catch (IOException e) {
+                LOGGER.warn("Invalid UTF-8 JSON stock message, msgId={}, reconsumeTimes={}, reason={}",
+                        message.getMsgId(), message.getReconsumeTimes(), e.getClass().getSimpleName());
+                return ConsumeConcurrentlyStatus.RECONSUME_LATER;
+            } catch (RuntimeException e) {
+                LOGGER.warn("Stock message consumption failed, msgId={}, stockLogId={}, reconsumeTimes={}",
+                        message.getMsgId(), stockLogId, message.getReconsumeTimes(), e);
+                return ConsumeConcurrentlyStatus.RECONSUME_LATER;
+            }
+        }
+        return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
+    }
+
+    private static int positiveInt(JsonNode payload, String field) {
+        JsonNode value = payload.path(field);
+        if (!value.isIntegralNumber() || !value.canConvertToInt() || value.intValue() <= 0) {
+            throw new IllegalArgumentException(field + " must be a positive int");
+        }
+        return value.intValue();
     }
 }

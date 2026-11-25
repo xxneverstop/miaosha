@@ -40,7 +40,7 @@ if errorlevel 1 (
     echo [FAIL] Maven build failed.
     exit /b 1
 )
-for %%F in ("%JAR%" "Dockerfile" "docker-compose.yml" ".dockerignore" ".env" "application.yml" "sql\miaosha.sql") do (
+for %%F in ("%JAR%" "Dockerfile" "docker-compose.yml" ".dockerignore" ".env" "application.yml" "sql\miaosha.sql" "sql\upgrade-001-stock-consume-log.sql") do (
     if not exist "%%~F" (
         echo [FAIL] Missing deploy input: %%~F
         exit /b 1
@@ -63,8 +63,10 @@ for %%F in ("Dockerfile" "docker-compose.yml" ".dockerignore" ".env" "applicatio
     call :copyFile "%%~F" "%MIAOSHA_PACKAGE_DEPLOY%\%%~F"
     if errorlevel 1 exit /b 1
 )
-call :copyFile "sql\miaosha.sql" "%MIAOSHA_PACKAGE_DEPLOY%\sql\miaosha.sql"
-if errorlevel 1 exit /b 1
+for %%F in ("miaosha.sql" "upgrade-001-stock-consume-log.sql") do (
+    call :copyFile "sql\%%~F" "%MIAOSHA_PACKAGE_DEPLOY%\sql\%%~F"
+    if errorlevel 1 exit /b 1
+)
 
 echo [3/3] Done: target\deploy
 echo Upload the whole deploy directory, including .env and .dockerignore.

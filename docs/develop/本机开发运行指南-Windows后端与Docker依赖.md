@@ -190,6 +190,19 @@ exit;
 
 应能看到商品 `6`、`7`，以及活动 `1`。`sql/miaosha.sql` **包含 DROP TABLE，只用于可重建的测试库**。自动导入仅在 MySQL 数据目录首次初始化时发生；已有命名卷不会重新导入，修改密码变量也不会自动修改已有库的密码。
 
+项目的 `sql/` 目录被挂载到 MySQL 容器的 `/docker-entrypoint-initdb.d/`。MySQL 首次初始化空数据目录时，先运行 `miaosha.sql` 建基础表，再运行 `upgrade-001-stock-consume-log.sql` 增加消费记录表。已有数据目录要手动执行增量 SQL。
+
+如果按本节启动了本机测试容器 `miaosha-mysql`，用 PowerShell 执行 `docker exec -it miaosha-mysql mysql -uroot -p miaosha`。输入本机测试库的密码后，在 `mysql>` 提示符中先执行 `SELECT DATABASE();`，确认结果是本次要升级的测试库，再执行下列命令。
+
+```sql
+SOURCE /docker-entrypoint-initdb.d/upgrade-001-stock-consume-log.sql
+SHOW CREATE TABLE stock_consume_log;
+```
+
+`SOURCE` 由 MySQL 命令行客户端读取文件。客户端在容器内运行时用上面的容器路径，从 Windows 直接运行 `mysql.exe` 时用项目里的 SQL 文件路径，例如 `SOURCE D:/workspace/dianshangmiaosha/sql/upgrade-001-stock-consume-log.sql`。看到 `ENGINE=InnoDB` 和 `PRIMARY KEY (stock_log_id)` 表示建表符合预期。已有测试库只运行增量文件。 [MySQL SOURCE 文档](https://dev.mysql.com/doc/refman/8.4/en/mysql-commands.html)
+
+`miaosha_stock_consume_it` 是给 JUnit 用例单独建的本机 MySQL 5.7 库。`MIAOSHA_STOCK_IT_JDBC_URL`、`MIAOSHA_STOCK_IT_USERNAME`、`MIAOSHA_STOCK_IT_PASSWORD` 只供测试进程使用。测试会核对目标库，写入和清理自己建立的 `item_stock`、`stock_log` 和 `stock_consume_log` 记录。可以按构建记录从空库搭建、运行并核对七个结果。 [人工验收步骤](../build-logs/2026-11-22-01-mq-stock-consume-idempotency.md#7-人工测试与验收)
+
 ### 4.4 创建 Redis
 
 ```powershell
@@ -438,7 +451,7 @@ SELECT COUNT(*) AS order_count, COALESCE(SUM(amount), 0) AS ordered_amount
 FROM order_info WHERE item_id = 6 AND promo_id = 1;
 ```
 
-服务成功启动和单次下单成功，只代表相应路径通过。当前消费幂等、异常事务回滚、补偿和重复请求仍有已知边界，见 [根 README](../../README.md#当前实现边界)；本指南没有修复这些业务问题。
+服务成功启动和单次下单成功只覆盖正常路径。验证异步 MySQL 扣库时，从本轮 `stock_log` 取库存流水号，再核对 `stock_consume_log` 中的一条消费记录及 `item_stock` 的库存变化。补偿和重复下单等业务边界见 [根 README](../../README.md#当前实现边界)。
 
 ## 8. 以后每天怎么运行
 

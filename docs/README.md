@@ -7,6 +7,7 @@
 ## develop：本机开发与运行
 
 - [本机开发运行指南：Windows 后端 + Docker 依赖](develop/本机开发运行指南-Windows后端与Docker依赖.md)：PowerShell 首次创建 MySQL、Redis、RocketMQ，使用 JDK 8 启动本机后端和 Python 静态页面；包含 IDEA 配置、日常启停和排错步骤。
+- [Windows 本机 RocketMQ 内存调整与消息观测](develop/RocketMQ-Broker内存调整与Dashboard观测-Windows.md) 说明现有 Broker 如何保留数据并调整 JVM 参数，以及 Dashboard 启停、队列观察和库存核对。
 
 ## my-docs：当前方案与实施记录
 

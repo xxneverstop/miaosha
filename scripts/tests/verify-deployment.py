@@ -68,7 +68,8 @@ check(result.returncode!=0 and not any(call[0] in ("stop","rm","run") for call i
 package_root=fixture/"package fixture";package_root.mkdir()
 for name in ("package.bat","Dockerfile","docker-compose.yml",".dockerignore"):shutil.copyfile(repo/name,package_root/name)
 (package_root/"sql").mkdir()
-(package_root/"sql"/"miaosha.sql").write_text("-- fixture only\n")
+for name in ("miaosha.sql", "upgrade-001-stock-consume-log.sql"):
+    (package_root/"sql"/name).write_text("-- fixture only\n")
 (package_root/".env").write_text(env_text)
 (package_root/"application.yml").write_text("logging: {}\n")
 stub=fixture/"stub tools";(stub/"bin").mkdir(parents=True)
@@ -83,12 +84,12 @@ if result.returncode:
     print(result.stderr.decode("utf-8",errors="replace"))
 check(result.returncode==0,"Batch: stub Maven succeeds")
 deploy=package_root/"target"/"deploy"
-check(all((deploy/name).is_file() for name in ("miaosha.jar","Dockerfile","docker-compose.yml",".dockerignore",".env","application.yml","sql/miaosha.sql")),"Batch: complete deployment package")
+check(all((deploy/name).is_file() for name in ("miaosha.jar","Dockerfile","docker-compose.yml",".dockerignore",".env","application.yml","sql/miaosha.sql","sql/upgrade-001-stock-consume-log.sql")),"Batch: complete deployment package")
 (deploy/"stale-marker").write_text("fixture")
 result=run_package();check(result.returncode==0 and not (deploy/"stale-marker").exists(),"Batch: safe cleanup")
 failure_env=package_env.copy();failure_env["STUB_MAVEN_FAILURE"]="1"
 check(run_package(failure_env).returncode!=0,"Batch: build failure is nonzero")
-source=package_root/"sql"/"miaosha.sql";data=source.read_bytes();source.unlink()
+source=package_root/"sql"/"upgrade-001-stock-consume-log.sql";data=source.read_bytes();source.unlink()
 (deploy/"preserve-marker").write_text("fixture")
 result=run_package();check(result.returncode!=0 and (deploy/"preserve-marker").exists(),"Batch: missing input preserves previous package")
 source.write_bytes(data)
